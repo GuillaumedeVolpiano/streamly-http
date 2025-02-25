@@ -1,2 +1,2 @@
 # streamly-http
-Streamly http client, inspired by conduit-http
+Streamly http client, inspired by http-conduit
