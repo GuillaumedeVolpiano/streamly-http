@@ -17,6 +17,7 @@ import Streamly.Data.Stream qualified as Stream
 import Streamly.Data.StreamK qualified as StreamK
 import Streamly.External.ByteString qualified as StreamlyBS
 import Streamly.External.Network.HTTP
+import Streamly.External.Network.HTTP.URL
 import Streamly.External.Network.HTTP.Wire (readResponse, readResponseHead, renderRequest, validateRequest)
 import Test.Tasty (TestTree, defaultMain, localOption, mkTimeout, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
@@ -32,6 +33,7 @@ tests =
       "streamly-http"
       [ testGroup "reading a response" reading
       , testGroup "writing a request" writing
+      , testGroup "URLs" urls
       , testGroup "over TCP" overTcp
       ]
 
@@ -193,6 +195,62 @@ writing =
       refused (get "example.org" 80 "/") {method = "GE T"}
       refused (withHeaders [("A", "b\r\nC: d")] (get "example.org" 80 "/"))
       refused (withHeaders [("A B", "c")] (get "example.org" 80 "/"))
+  ]
+
+urls :: [TestTree]
+urls =
+  [ testCase "a URL with everything" $
+      parseUrl "https://Example.ORG:8443/a/b?c=d#e" @?= Right (Url Https "example.org" 8443 "/a/b?c=d")
+  , testCase "the port of the scheme, and the root as the path" $ do
+      parseUrl "http://example.org" @?= Right (Url Http "example.org" 80 "/")
+      parseUrl "HTTPS://example.org" @?= Right (Url Https "example.org" 443 "/")
+      parseUrl "http://example.org?q=1" @?= Right (Url Http "example.org" 80 "/?q=1")
+      parseUrl "http://example.org/#top" @?= Right (Url Http "example.org" 80 "/")
+  , testCase "addresses as hosts" $ do
+      parseUrl "http://127.0.0.1:9330/api/image/k" @?= Right (Url Http "127.0.0.1" 9330 "/api/image/k")
+      parseUrl "http://[::1]:9330/" @?= Right (Url Http "::1" 9330 "/")
+      parseUrl "https://[2001:DB8::1]/x" @?= Right (Url Https "2001:db8::1" 443 "/x")
+  , testCase "what is refused" $ do
+      let refusedUrl text = either (const (pure ())) (\found -> assertFailure ("accepted " <> show text <> " as " <> show found)) (parseUrl text)
+      mapM_
+        refusedUrl
+        [ ""
+        , "example.org"
+        , "ftp://example.org/"
+        , "http:/example.org"
+        , "http://"
+        , "http://user@example.org/"
+        , "http://user:secret@example.org/"
+        , "http://example.org:/"
+        , "http://example.org:0/"
+        , "http://example.org:65536/"
+        , "http://example.org:80x/"
+        , "http://example.org/a b"
+        , "http://example.org/a\r\nX: y"
+        , "http://[::1/"
+        ]
+  , testCase "a URL is written back, the port of the scheme left out" $ do
+      map (fmap renderUrl . parseUrl) ["https://example.org:443/a?b", "http://example.org:8080", "http://[::1]:80/x"]
+        @?= [Right "https://example.org/a?b", Right "http://example.org:8080/", Right "http://[::1]/x"]
+  , testCase "references are resolved against a URL" $ do
+      let base = Url Http "example.org" 8080 "/a/b/c?q=1"
+          to reference = fmap renderUrl (resolve base reference)
+      to "https://other.example/x" @?= Right "https://other.example/x"
+      to "//other.example/x" @?= Right "http://other.example/x"
+      to "/x/y?z" @?= Right "http://example.org:8080/x/y?z"
+      to "d" @?= Right "http://example.org:8080/a/b/d"
+      to "../d/./e?f#g" @?= Right "http://example.org:8080/a/d/e?f"
+      to "../../../d" @?= Right "http://example.org:8080/d"
+      to "./" @?= Right "http://example.org:8080/a/b/"
+      to ".." @?= Right "http://example.org:8080/a/"
+      to "?other" @?= Right "http://example.org:8080/a/b/c?other"
+      to "" @?= Right "http://example.org:8080/a/b/c?q=1"
+      to "#frag" @?= Right "http://example.org:8080/a/b/c?q=1"
+      to "/a b" @?= Left "a space or a control character in a reference"
+      either (const (pure ())) (assertFailure . show) (to "ftp://example.org/")
+  , testCase "the request for a URL" $ do
+      bytes <- either fail (rendered . urlRequest) (parseUrl "https://example.org:8443/a?b")
+      bytes @?= "GET /a?b HTTP/1.1\r\nHost: example.org:8443\r\n\r\n"
   ]
 
 -- | Run a server that answers one connection: it reads the request head

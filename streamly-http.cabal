@@ -41,6 +41,7 @@ library
   hs-source-dirs:  src
   exposed-modules:
     Streamly.External.Network.HTTP
+    Streamly.External.Network.HTTP.URL
     Streamly.External.Network.HTTP.Wire
 
   build-depends:

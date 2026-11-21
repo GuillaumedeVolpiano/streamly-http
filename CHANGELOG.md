@@ -8,3 +8,5 @@
   transfer coding or by the end of the connection.
 * Requests over a connection of the caller (`Transport`,
   `withResponseOver`, `fetchOver`), for HTTPS among others.
+* `http` and `https` URLs: `parseUrl`, `renderUrl`, `resolve`,
+  `urlRequest`.

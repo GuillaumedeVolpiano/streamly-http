@@ -31,6 +31,8 @@ main = do
   `withResponse`).
 - `Streamly.External.Network.HTTP.Wire`: the message format alone
   (`renderRequest`, `readResponse`), to run it over another transport.
+- `Streamly.External.Network.HTTP.URL`: `http` and `https` URLs, read,
+  written back and resolved against one another.
 
 ## Limits of this version
 
@@ -40,7 +42,11 @@ main = do
   gives HTTPS.
 - One connection per request (`Connection: close`).
 - Redirects are not followed and content codings are not decoded.
-- No URL parsing: a request names its host, its port and its target.
+- A request names its host, its port and its target. URLs are read by
+  `Streamly.External.Network.HTTP.URL`; fetching by URL, with the scheme
+  choosing between TCP and TLS, is what
+  [streamly-http-tls](https://github.com/GuillaumedeVolpiano/streamly-http-tls)
+  adds.
 - No limit on time or size: use `System.Timeout.timeout`, and count the
   bytes of the body stream if the server is not trusted.
 - A status is never an error: look at `status`.
