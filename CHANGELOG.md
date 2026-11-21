@@ -6,3 +6,5 @@
 * The message format on streams of byte arrays: `renderRequest`,
   `readResponse`. Bodies delimited by `Content-Length`, by the chunked
   transfer coding or by the end of the connection.
+* Requests over a connection of the caller (`Transport`,
+  `withResponseOver`, `fetchOver`), for HTTPS among others.

@@ -34,7 +34,10 @@ main = do
 
 ## Limits of this version
 
-- Plain TCP only: no TLS.
+- TLS is not built in. `withResponseOver` and `fetchOver` take a connection
+  opened by other means, as a `Transport`: one of
+  [streamly-network-tls](https://github.com/GuillaumedeVolpiano/streamly-network-tls)
+  gives HTTPS.
 - One connection per request (`Connection: close`).
 - Redirects are not followed and content codings are not decoded.
 - No URL parsing: a request names its host, its port and its target.

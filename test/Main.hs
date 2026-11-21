@@ -7,6 +7,7 @@ import Control.Exception (bracket, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
+import Data.IORef (modifyIORef, newIORef, readIORef)
 import Data.Word (Word8)
 import Network.Socket qualified as Net
 import Network.Socket.ByteString qualified as NetBS
@@ -243,6 +244,14 @@ overTcp =
         fetch (withHeaders [("connection", "keep-alive")] (get "127.0.0.1" port "/"))
       BS.drop (BS.length request - 23) request @?= "\r\nConnection: close\r\n\r\n"
       BS.isInfixOf "keep-alive" request @?= False
+  , testCase "over a transport of the caller: what is sent, and the response read" $ do
+      sent <- newIORef []
+      let answer = map StreamlyBS.toArray ["HTTP/1.1 200 OK\r\nContent-Le", "ngth: 5\r\n\r\nhel", "lo"]
+          transport = Transport {send = \array -> modifyIORef sent (StreamlyBS.fromArray array :), receive = Stream.fromList answer}
+      response <- fetchOver transport (get "example.org" 443 "/secure")
+      (response.status, StreamlyBS.fromArray response.body) @?= (200, "hello")
+      request <- BS.concat . reverse <$> readIORef sent
+      request @?= "GET /secure HTTP/1.1\r\nHost: example.org:443\r\nConnection: close\r\n\r\n"
   , testCase "a status is not an error" $ do
       (_, response) <- withServer ["HTTP/1.1 400 Bad Request\r\nContent-Length: 20\r\n\r\nInvalid Scale: bogus"] $ \port ->
         fetch (get "127.0.0.1" port "/")

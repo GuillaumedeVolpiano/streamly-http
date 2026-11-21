@@ -15,8 +15,9 @@
 -- >   response <- fetch (get "example.org" 80 "/")
 -- >   print (response.status, header "content-type" response)
 --
--- Each request opens a connection and closes it afterwards. There is no
--- TLS, no redirect is followed, no content coding is decoded, and nothing
+-- Each request opens a connection and closes it afterwards. TLS is not
+-- built in: 'withResponseOver' takes a connection opened by other means,
+-- such as one of @streamly-network-tls@. No redirect is followed, no content coding is decoded, and nothing
 -- limits the time taken or the size of a response: wrap the calls in
 -- 'System.Timeout.timeout' and count the bytes of the stream as needed. A
 -- status is never an error: look at 'status'.
@@ -34,6 +35,12 @@ module Streamly.External.Network.HTTP
   , header
   , withResponse
   , fetch
+
+    -- * Other transports
+  , Transport (..)
+  , socketTransport
+  , withResponseOver
+  , fetchOver
   , connect
 
     -- * Errors
@@ -48,6 +55,7 @@ import Data.Word (Word8)
 import Network.Socket qualified as Net
 import Streamly.Data.Array (Array)
 import Streamly.Data.Array qualified as Array
+import Streamly.Data.Fold qualified as Fold
 import Streamly.Data.Stream (Stream)
 import Streamly.Data.Stream qualified as Stream
 import Streamly.Data.StreamK qualified as StreamK
@@ -74,16 +82,47 @@ get host port target = Request {method = "GET", host, port, target, headers = []
 withResponse :: Request -> (Response (Stream IO (Array Word8)) -> IO a) -> IO a
 withResponse request use = do
   either throwIO pure (validateRequest request)
-  bracket (connect request.host request.port) Net.close $ \socket -> do
-    Stream.fold (Socket.writeChunks socket) (renderRequest closing)
-    response <- readResponse request.method (StreamK.fromStream (Socket.readChunks socket))
-    use response
-  where
-    closing = withHeaders (filter (\(name, _) -> BS8.map toLower name /= "connection") request.headers <> [("Connection", "close")]) request
+  bracket (connect request.host request.port) Net.close $ \socket ->
+    withResponseOver (socketTransport socket) request use
 
 -- | Send a request and read the whole response into memory.
 fetch :: Request -> IO (Response (Array Word8))
-fetch request = withResponse request $ \response -> do
+fetch request = withResponse request collect
+
+-- | A connection that is already open, as the two things an exchange
+-- needs. It lets a request go over something other than plain TCP: a TLS
+-- connection, for HTTPS.
+data Transport = Transport
+  { send :: Array Word8 -> IO ()
+  -- ^ Send bytes.
+  , receive :: Stream IO (Array Word8)
+  -- ^ The bytes received, until the other side ends the connection.
+  }
+
+-- | A TCP socket as a transport.
+socketTransport :: Net.Socket -> Transport
+socketTransport socket = Transport {send = Socket.putChunk socket, receive = Socket.readChunks socket}
+
+-- | Like 'withResponse', over a connection that is already open. The host
+-- and the port of the request only serve its @Host@ header. The request
+-- asks the server to close the connection after the response: one
+-- exchange for each transport. Opening and closing it are up to the
+-- caller.
+withResponseOver :: Transport -> Request -> (Response (Stream IO (Array Word8)) -> IO a) -> IO a
+withResponseOver transport request use = do
+  either throwIO pure (validateRequest request)
+  Stream.fold (Fold.drainMapM transport.send) (renderRequest closing)
+  response <- readResponse request.method (StreamK.fromStream transport.receive)
+  use response
+  where
+    closing = withHeaders (filter (\(name, _) -> BS8.map toLower name /= "connection") request.headers <> [("Connection", "close")]) request
+
+-- | Like 'fetch', over a connection that is already open.
+fetchOver :: Transport -> Request -> IO (Response (Array Word8))
+fetchOver transport request = withResponseOver transport request collect
+
+collect :: Response (Stream IO (Array Word8)) -> IO (Response (Array Word8))
+collect response = do
   bytes <- Stream.fold Array.create (Stream.unfoldEach Array.reader response.body)
   pure (bytes <$ response)
 
