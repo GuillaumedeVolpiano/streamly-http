@@ -87,6 +87,9 @@ main = withClient defaultLimits $ \client -> do
 
 ## Building
 
-[streamly-network-tcp](https://github.com/GuillaumedeVolpiano/streamly-network-tcp) is not on Hackage yet: `cabal.project` fetches it from GitHub, at its
-release. To build against a copy checked out next to this repository
+[streamly-network-tcp](https://github.com/GuillaumedeVolpiano/streamly-network-tcp)
+and
+[streamly-flatparse](https://github.com/GuillaumedeVolpiano/streamly-flatparse)
+are not on Hackage yet: `cabal.project` fetches them from GitHub, at their
+releases. To build against copies checked out next to this repository
 instead, pass `--project-file=cabal.project.siblings`.

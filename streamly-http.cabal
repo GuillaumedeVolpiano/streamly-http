@@ -1,6 +1,6 @@
 cabal-version:   3.12
 name:            streamly-http
-version:         0.2.0.0
+version:         0.3.0.0
 synopsis:        A small HTTP/1.1 client written with Streamly
 description:
   An HTTP/1.1 client over plain TCP. The response head is read with
