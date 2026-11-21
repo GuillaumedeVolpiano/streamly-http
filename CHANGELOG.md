@@ -1,5 +1,13 @@
 # Revision history for streamly-http
 
+## 0.2.0.0 -- unreleased
+
+* Time limits: `Limits`, with thirty seconds to connect and thirty seconds
+  of silence by default, in `withResponse` and `fetch`; `withResponseWithin`
+  and `fetchWithin` take others. `limitTransport` gives them to a transport
+  of the caller, and `connectWithin` to a TCP connection.
+* `HttpError` gains `ConnectTimedOut` and `ResponseTimedOut`.
+
 ## 0.1.0.0 -- 2026-11-21
 
 * An HTTP/1.1 client over TCP: `get`, `fetch`, `withResponse`.

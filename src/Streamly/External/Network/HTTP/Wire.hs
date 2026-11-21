@@ -114,6 +114,11 @@ data HttpError
   | -- | The input ended inside the body: the number of bytes still expected
     -- (of the current chunk, for a chunked body).
     TruncatedBody Int
+  | -- | The connection could not be opened within the time allowed.
+    ConnectTimedOut
+  | -- | The server went silent for longer than allowed, before or inside
+    -- its response, or stopped reading the request.
+    ResponseTimedOut
   deriving stock (Eq, Show)
 
 instance Exception HttpError

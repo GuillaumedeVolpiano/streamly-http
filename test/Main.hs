@@ -3,12 +3,14 @@
 module Main (main) where
 
 import Control.Concurrent.Async (wait, withAsync)
-import Control.Exception (bracket, try)
+import Control.Concurrent (threadDelay)
+import Control.Exception (bracket, catch, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.IORef (modifyIORef, newIORef, readIORef)
 import Data.Word (Word8)
+import GHC.Clock (getMonotonicTime)
 import Network.Socket qualified as Net
 import Network.Socket.ByteString qualified as NetBS
 import Streamly.Data.Array (Array)
@@ -20,7 +22,8 @@ import Streamly.External.Network.HTTP
 import Streamly.External.Network.HTTP.URL
 import Streamly.External.Network.HTTP.Wire (readResponse, readResponseHead, renderRequest, validateRequest)
 import Test.Tasty (TestTree, defaultMain, localOption, mkTimeout, testGroup)
-import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
+import System.Timeout (timeout)
+import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
 import Test.Tasty.QuickCheck (Positive (..), ioProperty, testProperty, (===))
 
 main :: IO ()
@@ -282,6 +285,35 @@ withServer answer action =
           more <- NetBS.recv peer 4096
           if BS.null more then pure seen else readHead peer (seen <> more)
 
+-- | Limits short enough for the tests.
+quick :: Limits
+quick = Limits {connectTimeout = Just 2_000_000, idleTimeout = Just 150_000}
+
+-- | A server that reads the request, sends the pieces of an answer with a
+-- pause in microseconds before each, then holds the connection open.
+withSlowServer :: Int -> [ByteString] -> (Int -> IO a) -> IO a
+withSlowServer pause answer action =
+  bracket open Net.close $ \listener -> do
+    port <- Net.socketPort listener
+    withAsync (serve listener) $ \_ -> action (fromIntegral port)
+  where
+    open = do
+      listener <- Net.socket Net.AF_INET Net.Stream Net.defaultProtocol
+      Net.setSocketOption listener Net.ReuseAddr 1
+      Net.bind listener (Net.SockAddrInet 0 (Net.tupleToHostAddress (127, 0, 0, 1)))
+      Net.listen listener 1
+      pure listener
+    serve listener =
+      bracket (fst <$> Net.accept listener) Net.close $ \peer -> do
+        _ <- NetBS.recv peer 4096
+        mapM_ (\piece -> threadDelay pause >> NetBS.sendAll peer piece) answer
+        threadDelay 10_000_000
+
+-- | A server that sends the pieces of an answer at once, then holds the
+-- connection open without a word.
+withHeldServer :: [ByteString] -> (Int -> IO a) -> IO a
+withHeldServer = withSlowServer 0
+
 overTcp :: [TestTree]
 overTcp =
   [ testCase "fetch sends the request and reads the whole body" $ do
@@ -319,6 +351,37 @@ overTcp =
       case outcome of
         Left problem -> problem @?= TruncatedBody 7
         Right _ -> assertFailure "no error, expected TruncatedBody"
+  , testCase "a server that accepts and says nothing" $ do
+      outcome <- withHeldServer [] $ \port -> try (fetchWithin quick (get "127.0.0.1" port "/"))
+      outcome @?= Left ResponseTimedOut
+  , testCase "a server that stops in the middle of the body" $ do
+      outcome <- withHeldServer ["HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"] $ \port ->
+        try (fetchWithin quick (get "127.0.0.1" port "/"))
+      outcome @?= Left ResponseTimedOut
+  , testCase "a slow response is not a silent one: each wait is bounded, not the whole" $ do
+      let answer = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n" : map BS.singleton (BS.unpack "slowly")
+      response <- withSlowServer 60_000 answer $ \port -> fetchWithin quick (get "127.0.0.1" port "/")
+      StreamlyBS.fromArray response.body @?= "slowly"
+  , testCase "without limits a held connection is waited for" $ do
+      outcome <- withHeldServer [] $ \port -> timeout 300_000 (fetchWithin noLimits (get "127.0.0.1" port "/"))
+      fmap (.status) outcome @?= Nothing
+  , testCase "a limited transport bounds receiving and sending" $ do
+      let silent = Transport {send = \_ -> pure (), receive = Stream.repeatM (threadDelay 5_000_000 >> pure (StreamlyBS.toArray ""))}
+          deaf = Transport {send = \_ -> threadDelay 5_000_000, receive = Stream.nil}
+      failsWith ResponseTimedOut (fetchOver (limitTransport (Just 50_000) silent) (get "example.org" 80 "/"))
+      failsWith ResponseTimedOut (fetchOver (limitTransport (Just 50_000) deaf) (get "example.org" 80 "/"))
+  , testCase "connecting gives up in time" $ do
+      -- An address that answers nothing where it is routed, and is refused
+      -- at once where it is not: either way the wait is bounded.
+      before <- getMonotonicTime
+      outcome <- try (connectWithin (Just 200_000) "10.255.255.1" 81)
+      after <- getMonotonicTime
+      case outcome of
+        Left ConnectTimedOut -> pure ()
+        Left other -> assertFailure ("expected ConnectTimedOut, got " <> show other)
+        Right socket -> Net.close socket
+        `catch` \(_ :: IOError) -> pure ()
+      assertBool ("waited " <> show (after - before) <> " s") (after - before < 2)
   , testCase "an invalid request is refused before any connection" $
       failsWithInvalid (fetch (get "127.0.0.1" 1 "/a b"))
   , testCase "nothing listening is an IOError" $ do
