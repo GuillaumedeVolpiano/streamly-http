@@ -1,5 +1,8 @@
-# Revision history for streamly-effectful-wreq
+# Revision history for streamly-http
 
-## 0.1.0.0 -- YYYY-mm-dd
+## 0.1.0.0 -- unreleased
 
-* First version. Released on an unsuspecting world.
+* An HTTP/1.1 client over TCP: `get`, `fetch`, `withResponse`.
+* The message format on streams of byte arrays: `renderRequest`,
+  `readResponse`. Bodies delimited by `Content-Length`, by the chunked
+  transfer coding or by the end of the connection.
