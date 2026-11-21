@@ -42,6 +42,17 @@ announced or it was chunked, and the server did not ask to close. A
 connection that the server has closed while idle is replaced without a
 word: the request is sent again once, unless its body is a stream.
 
+For several servers, `withClient` keeps a session for each, and more than
+one for a server whose requests overlap:
+
+```haskell
+main :: IO ()
+main = withClient defaultLimits $ \client -> do
+  first <- fetchFrom client Http (get "example.org" 80 "/a")
+  second <- fetchFrom client Http (get "example.net" 80 "/b")
+  print (first.status, second.status)
+```
+
 ## Modules
 
 - `Streamly.External.Network.HTTP`: the client over TCP (`get`, `fetch`,

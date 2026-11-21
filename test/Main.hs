@@ -3,8 +3,10 @@
 module Main (main) where
 
 import Control.Concurrent.Async (wait, withAsync)
-import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, bracket, try)
+import Control.Concurrent (forkIOWithUnmask, threadDelay)
+import Control.Exception (SomeException, bracket, finally, mask_, try)
+import Control.Monad (void)
+import Data.List (sort)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
@@ -473,8 +475,8 @@ overTcp =
       Net.bind socket (Net.SockAddrInet 0 (Net.tupleToHostAddress (127, 0, 0, 1)))
       fromIntegral <$> Net.socketPort socket
 
--- | Run a server that takes connections one after the other and, on each,
--- answers request after request with a function of the number of the
+-- | Run a server that serves each connection in a thread of its own and,
+-- on each, answers request after request with a function of the number of the
 -- connection, the number of the request on it and its target. An answer
 -- of 'Nothing' closes the connection without a word; 'True' with the
 -- bytes closes it after them. Gives the port, and returns the result with
@@ -484,7 +486,7 @@ withKeepingServer answer action = do
   seen <- newIORef []
   bracket open Net.close $ \listener -> do
     port <- Net.socketPort listener
-    result <- withAsync (mapM_ (connection seen listener) [1 ..]) $ \_ -> action (fromIntegral port)
+    result <- withAsync (mapM_ (accepting seen listener) [1 ..]) $ \_ -> action (fromIntegral port)
     (result,) . reverse <$> readIORef seen
   where
     open = do
@@ -493,8 +495,9 @@ withKeepingServer answer action = do
       Net.bind listener (Net.SockAddrInet 0 (Net.tupleToHostAddress (127, 0, 0, 1)))
       Net.listen listener 5
       pure listener
-    connection seen listener number =
-      bracket (fst <$> Net.accept listener) Net.close $ \peer -> requests seen peer number (1 :: Int) ""
+    accepting seen listener number = mask_ $ do
+      (peer, _) <- Net.accept listener
+      void (forkIOWithUnmask (\unmask -> void (try @SomeException (unmask (requests seen peer number (1 :: Int) ""))) `finally` Net.close peer))
     requests seen peer number index buffered = do
       (requestHead', rest) <- readHead peer buffered
       if BS.null requestHead'
@@ -524,7 +527,30 @@ bodies = map (\response -> StreamlyBS.fromArray response.body)
 
 sessions :: [TestTree]
 sessions =
-  [ testCase "requests share one connection, whether the bodies are announced or chunked" $ do
+  [ testCase "a client keeps a connection for each server" $ do
+      let answer _ _ target = Just (lengthAnswer target, False)
+      ((responses, seenByOther), seen) <- withKeepingServer answer $ \port ->
+        withKeepingServer answer $ \other ->
+          withClient defaultLimits $ \client ->
+            mapM (\(to, target) -> fetchFrom client Http (get "127.0.0.1" to target)) [(port, "/a"), (other, "/b"), (port, "/c"), (other, "/d"), (port, "/e")]
+      bodies responses @?= ["/a", "/b", "/c", "/d", "/e"]
+      seen @?= [(1, 1, "/a"), (1, 2, "/c"), (1, 3, "/e")]
+      seenByOther @?= [(1, 1, "/b"), (1, 2, "/d")]
+  , testCase "requests to one server that overlap have a connection each, both kept afterwards" $ do
+      (inner, seen) <- withKeepingServer (\_ _ target -> Just (lengthAnswer target, False)) $ \port ->
+        withClient defaultLimits $ \client -> do
+          inner <- withResponseFrom client Http (get "127.0.0.1" port "/outer") $ \_ ->
+            fetchFrom client Http (get "127.0.0.1" port "/inner")
+          -- The outer body was not read: its connection is gone, the
+          -- other one is kept and serves again.
+          again <- fetchFrom client Http (get "127.0.0.1" port "/again")
+          pure (bodies [inner, again])
+      inner @?= ["/inner", "/again"]
+      sort seen @?= [(1, 1, "/outer"), (2, 1, "/inner"), (2, 2, "/again")]
+  , testCase "a client in clear refuses a request over TLS" $ do
+      outcome <- try (withClient defaultLimits (\client -> fetchFrom client Https (get "example.org" 443 "/")))
+      fmap (.status) outcome @?= Left (InvalidRequest "this client only speaks in clear")
+  , testCase "requests share one connection, whether the bodies are announced or chunked" $ do
       let answer _ _ = \case
             "/chunked" -> Just ("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\nTrailer: x\r\n\r\n", False)
             "/empty" -> Just ("HTTP/1.1 204 No Content\r\n\r\n", False)

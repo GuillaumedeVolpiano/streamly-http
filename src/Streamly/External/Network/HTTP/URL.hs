@@ -40,7 +40,7 @@ import Streamly.External.Network.HTTP.Wire (Request (..), RequestBody (..))
 data Scheme
   = Http
   | Https
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Ord, Show)
 
 -- | The port of a scheme when the URL names none: 80 and 443.
 defaultPort :: Scheme -> Int

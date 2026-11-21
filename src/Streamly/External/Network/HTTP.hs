@@ -52,6 +52,13 @@ module Streamly.External.Network.HTTP
   , withResponseIn
   , fetchIn
 
+    -- * Several servers, their connections kept
+  , Client
+  , withClient
+  , withClientOver
+  , withResponseFrom
+  , fetchFrom
+
     -- * Other transports
   , Transport (..)
   , socketTransport
@@ -65,10 +72,13 @@ module Streamly.External.Network.HTTP
   , HttpError (..)
   ) where
 
-import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar)
-import Control.Exception (IOException, SomeException, bracket, bracketOnError, finally, fromException, mask, onException, throwIO, try)
+import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, putMVar, readMVar, takeMVar)
+import Control.Exception (IOException, SomeException, bracket, bracketOnError, finally, fromException, mask, mask_, onException, throwIO, try)
 import Control.Monad (void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BS8
 import Data.Char (toLower)
@@ -80,6 +90,7 @@ import Streamly.Data.Fold qualified as Fold
 import Streamly.Data.Stream (Stream)
 import Streamly.Data.Stream qualified as Stream
 import Streamly.Data.StreamK qualified as StreamK
+import Streamly.External.Network.HTTP.URL (Scheme (..))
 import Streamly.External.Network.HTTP.Wire
 import Streamly.Network.Socket qualified as Socket
 import System.Timeout (timeout)
@@ -237,9 +248,84 @@ withSession limits host port = withSessionOver limits $ do
 -- among others. The time to connect is up to that action; the other
 -- limits apply.
 withSessionOver :: Limits -> IO (Transport, IO ()) -> (Session -> IO a) -> IO a
-withSessionOver limits opener = bracket (Session opener limits <$> newMVar Nothing) finish
+withSessionOver limits opener = bracket (newSession limits opener) closeSession
+
+newSession :: Limits -> IO (Transport, IO ()) -> IO Session
+newSession limits opener = Session opener limits <$> newMVar Nothing
+
+-- | Close the connection a session keeps. The session can still be used:
+-- its next request opens another.
+closeSession :: Session -> IO ()
+closeSession session = mask_ $ do
+  kept <- takeMVar session.live
+  mapM_ (quietly . (.shut)) kept
+  putMVar session.live Nothing
+
+-- | Connections to any number of servers, kept from one request to the
+-- next: a session for each server asked, and more than one when requests
+-- to the same server overlap.
+data Client = Client
+  { connectTo :: Scheme -> String -> Int -> IO (Transport, IO ())
+  , limits :: Limits
+  , idle :: MVar (Maybe (Map (Scheme, String, Int) [Session]))
+  -- ^ The sessions not in use, by server; 'Nothing' once the client is
+  -- closed.
+  }
+
+-- | How many sessions not in use are kept for one server.
+maxIdleSessions :: Int
+maxIdleSessions = 4
+
+-- | Use a client over plain TCP. Its requests ('withResponseFrom',
+-- 'fetchFrom') reuse the connections it keeps, as those of a session do,
+-- for every server they go to. A request over TLS is refused with
+-- 'InvalidRequest': see @streamly-http-tls@ for a client that does both.
+-- The connections kept are closed at the end.
+withClient :: Limits -> (Client -> IO a) -> IO a
+withClient limits = withClientOver limits $ \scheme host port -> case scheme of
+  Https -> throwIO (InvalidRequest "this client only speaks in clear")
+  Http -> do
+    socket <- connectWithin limits.connectTimeout host port
+    -- See withSession.
+    Net.setSocketOption socket Net.NoDelay 1
+    pure (socketTransport socket, Net.close socket)
+
+-- | Like 'withClient', with the way to open a connection to a server left
+-- to a function of the scheme, the host and the port, which gives a
+-- transport and what closes it.
+withClientOver :: Limits -> (Scheme -> String -> Int -> IO (Transport, IO ())) -> (Client -> IO a) -> IO a
+withClientOver limits connectTo = bracket (Client connectTo limits <$> newMVar (Just Map.empty)) finish
   where
-    finish session = takeMVar session.live >>= mapM_ (quietly . (.shut))
+    finish client = mask_ $ do
+      kept <- takeMVar client.idle
+      putMVar client.idle Nothing
+      mapM_ closeSession (concat (maybe [] Map.elems kept))
+
+-- | Send a request to the host and the port it names, in clear or over
+-- TLS, and use the response, as 'withResponseIn' does, over a connection
+-- the client keeps for that server when one is free.
+withResponseFrom :: Client -> Scheme -> Request -> (Response (Stream IO (Array Word8)) -> IO a) -> IO a
+withResponseFrom client scheme request use = do
+  either throwIO pure (validateRequest request)
+  bracket acquire release (\session -> withResponseIn session request use)
+  where
+    server = (scheme, request.host, request.port)
+    acquire = modifyMVar client.idle $ \kept -> case kept >>= Map.lookup server of
+      Just (session : others) -> pure (Map.insert server others <$> kept, session)
+      _ -> (kept,) <$> newSession client.limits (client.connectTo scheme request.host request.port)
+    release session = do
+      -- A session that has lost its connection is not worth keeping: it
+      -- would only stand before one that still has its own.
+      connected <- isJust <$> readMVar session.live
+      keep <- modifyMVar client.idle $ \kept -> pure $ case kept of
+        Just sessions | connected, length (Map.findWithDefault [] server sessions) < maxIdleSessions -> (Just (Map.insertWith (<>) server [session] sessions), True)
+        _ -> (kept, False)
+      if keep then pure () else closeSession session
+
+-- | Send a request through a client and read the whole response into
+-- memory. See 'withResponseFrom'.
+fetchFrom :: Client -> Scheme -> Request -> IO (Response (Array Word8))
+fetchFrom client scheme request = withResponseFrom client scheme request collect
 
 -- | Send a request in a session and use the response, as 'withResponse'
 -- does, over the connection of the session when there is one.
