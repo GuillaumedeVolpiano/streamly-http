@@ -21,7 +21,9 @@ module Streamly.External.Network.HTTP.Wire
   , Response (..)
   , header
   , readResponse
+  , readResponseWithin
   , readResponseHead
+  , readResponseHeadWithin
 
     -- * Errors
   , HttpError (..)
@@ -36,6 +38,7 @@ import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Numeric (showHex)
 import Streamly.Data.Array (Array)
@@ -114,6 +117,12 @@ data HttpError
   | -- | The input ended inside the body: the number of bytes still expected
     -- (of the current chunk, for a chunked body).
     TruncatedBody Int
+  | -- | The head of the response is longer than allowed: the limit, in
+    -- bytes.
+    HeadTooLarge Int
+  | -- | The body of the response is longer than allowed: the limit, in
+    -- bytes.
+    BodyTooLarge Int
   | -- | The connection could not be opened within the time allowed.
     ConnectTimedOut
   | -- | The server went silent for longer than allowed, before or inside
@@ -186,10 +195,23 @@ renderRequest request = case request.body of
 --
 -- Throws 'HttpError': here for the head, from the stream for the body.
 readResponse :: ByteString -> StreamK IO (Array Word8) -> IO (Response (Stream IO (Array Word8)))
-readResponse method input = do
-  (found, rest) <- readResponseHead input
+readResponse = readResponseWithin Nothing Nothing
+
+-- | Like 'readResponse', with the largest head and the largest body
+-- accepted, in bytes; 'Nothing' accepts any. The head counts the interim
+-- responses skipped; the body is counted as received, after the chunked
+-- coding is undone.
+--
+-- Throws 'HeadTooLarge' here. 'BodyTooLarge' is thrown here when the
+-- response announces too long a body, and from the stream otherwise.
+readResponseWithin :: Maybe Int -> Maybe Int -> ByteString -> StreamK IO (Array Word8) -> IO (Response (Stream IO (Array Word8)))
+readResponseWithin maxHead maxBody method input = do
+  (found, rest) <- readResponseHeadWithin maxHead input
   framing <- either throwIO pure (bodyFraming method found)
-  pure (bodyStream framing rest <$ found)
+  case (framing, maxBody) of
+    (Fixed announced, Just limit) | announced > limit -> throwIO (BodyTooLarge limit)
+    _ -> pure ()
+  pure (maybe id limitBody maxBody (bodyStream framing rest) <$ found)
 
 -- | Read the head of a response, and give what follows it in the input:
 -- the body, or after a status 101 the bytes of the protocol switched to.
@@ -197,11 +219,56 @@ readResponse method input = do
 --
 -- Throws 'MalformedResponse'.
 readResponseHead :: StreamK IO (Array Word8) -> IO (Response (), StreamK IO (Array Word8))
-readResponseHead input = do
+readResponseHead = readResponseHeadWithin Nothing
+
+-- | Like 'readResponseHead', with the largest head accepted, in bytes,
+-- interim responses included; 'Nothing' accepts any. Throws 'HeadTooLarge'
+-- beyond.
+readResponseHeadWithin :: Maybe Int -> StreamK IO (Array Word8) -> IO (Response (), StreamK IO (Array Word8))
+readResponseHeadWithin Nothing input = headFrom input
+readResponseHeadWithin (Just limit) input = do
+  -- The bytes the head may still take; Nothing once the head is read.
+  allowance <- newIORef (Just limit)
+  let step from =
+        readIORef allowance >>= \case
+          Nothing -> StreamK.uncons from
+          Just 0 -> throwIO (HeadTooLarge limit)
+          Just left ->
+            StreamK.uncons from >>= \case
+              Nothing -> pure Nothing
+              Just (array, rest)
+                | Array.length array <= left -> do
+                    writeIORef allowance (Just (left - Array.length array))
+                    pure (Just (array, rest))
+                | otherwise -> do
+                    -- Hand over what the head may still take; the rest of
+                    -- the array waits, for the body if the head ends there.
+                    let (front, back) = BS.splitAt left (StreamlyBS.fromArray array)
+                    writeIORef allowance (Just 0)
+                    pure (Just (StreamlyBS.toArray front, StreamK.cons (StreamlyBS.toArray back) rest))
+  (found, rest) <- headFrom (StreamK.fromStream (Stream.unfoldrM step input))
+  writeIORef allowance Nothing
+  pure (found, rest)
+
+headFrom :: StreamK IO (Array Word8) -> IO (Response (), StreamK IO (Array Word8))
+headFrom input = do
   (found, rest) <- parseOrThrow responseHead input
   if found.status >= 100 && found.status < 200 && found.status /= 101
-    then readResponseHead rest
+    then headFrom rest
     else pure (found, rest)
+
+-- | Stop a body that grows beyond a number of bytes.
+limitBody :: Int -> Stream IO (Array Word8) -> Stream IO (Array Word8)
+limitBody limit body = Stream.concatEffect $ do
+  total <- newIORef 0
+  pure $
+    Stream.mapM
+      ( \array -> do
+          size <- (+ Array.length array) <$> readIORef total
+          when (size > limit) (throwIO (BodyTooLarge limit))
+          array <$ writeIORef total size
+      )
+      body
 
 -- | How the end of a body is found (RFC 9112, section 6.3).
 data Framing

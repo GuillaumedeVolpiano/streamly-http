@@ -6,7 +6,13 @@
   of silence by default, in `withResponse` and `fetch`; `withResponseWithin`
   and `fetchWithin` take others. `limitTransport` gives them to a transport
   of the caller, and `connectWithin` to a TCP connection.
-* `HttpError` gains `ConnectTimedOut` and `ResponseTimedOut`.
+* Size limits in `Limits`: the head of a response is at most 64 KiB by
+  default (`maxHeadSize`); the body can be bounded (`maxBodySize`, no limit
+  by default). `readResponseWithin` and `readResponseHeadWithin` take them
+  at the level of the message format.
+* `withResponseOver` and `fetchOver` take the `Limits`.
+* `HttpError` gains `ConnectTimedOut`, `ResponseTimedOut`, `HeadTooLarge`
+  and `BodyTooLarge`.
 
 ## 0.1.0.0 -- 2026-11-21
 

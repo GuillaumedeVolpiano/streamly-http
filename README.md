@@ -47,8 +47,8 @@ main = do
   choosing between TCP and TLS, is what
   [streamly-http-tls](https://github.com/GuillaumedeVolpiano/streamly-http-tls)
   adds.
-- Each wait is limited (`Limits`: thirty seconds to connect, thirty
-  seconds of silence by default), but not the whole exchange nor the size
-  of a response: use `System.Timeout.timeout`, and count the bytes of the
-  body stream if the server is not trusted.
+- `Limits` bounds each wait (thirty seconds to connect, thirty seconds of
+  silence by default) and the head of a response (64 KiB by default). The
+  whole exchange is not bounded: use `System.Timeout.timeout`. The body is
+  not either by default: set `maxBodySize` when the server is not trusted.
 - A status is never an error: look at `status`.

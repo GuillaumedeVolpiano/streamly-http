@@ -97,7 +97,8 @@ withResponse = withResponseWithin defaultLimits
 fetch :: Request -> IO (Response (Array Word8))
 fetch = fetchWithin defaultLimits
 
--- | How long to wait, in microseconds. 'Nothing' waits without end.
+-- | How long to wait, in microseconds, and how much to accept, in bytes.
+-- 'Nothing' sets no limit.
 data Limits = Limits
   { connectTimeout :: Maybe Int
   -- ^ For the connection to open.
@@ -106,19 +107,29 @@ data Limits = Limits
   -- started or not, and to take the next bytes of the request. It bounds
   -- each wait, not the whole exchange: a response that keeps coming can
   -- take any time. Bound the whole with 'System.Timeout.timeout'.
+  , maxHeadSize :: Maybe Int
+  -- ^ For the status line and the headers of the response, interim
+  -- responses included. 'HeadTooLarge' beyond.
+  , maxBodySize :: Maybe Int
+  -- ^ For the body of the response, as received. 'BodyTooLarge' beyond:
+  -- at once when the response announces its length, from the stream
+  -- otherwise.
   }
   deriving stock (Eq, Show)
 
--- | Thirty seconds to connect, thirty seconds of silence.
+-- | Thirty seconds to connect, thirty seconds of silence, a head of at
+-- most 64 KiB, and a body of any size: set 'maxBodySize' before reading a
+-- whole response into memory from a server that is not trusted.
 defaultLimits :: Limits
-defaultLimits = Limits {connectTimeout = Just 30_000_000, idleTimeout = Just 30_000_000}
+defaultLimits = Limits {connectTimeout = Just 30_000_000, idleTimeout = Just 30_000_000, maxHeadSize = Just 65536, maxBodySize = Nothing}
 
 -- | No limit at all.
 noLimits :: Limits
-noLimits = Limits {connectTimeout = Nothing, idleTimeout = Nothing}
+noLimits = Limits {connectTimeout = Nothing, idleTimeout = Nothing, maxHeadSize = Nothing, maxBodySize = Nothing}
 
 -- | Like 'withResponse', within other limits than 'defaultLimits'.
--- Throws 'ConnectTimedOut' and 'ResponseTimedOut' when they are exceeded.
+-- Throws 'ConnectTimedOut', 'ResponseTimedOut', 'HeadTooLarge' and
+-- 'BodyTooLarge' when they are exceeded.
 withResponseWithin :: Limits -> Request -> (Response (Stream IO (Array Word8)) -> IO a) -> IO a
 withResponseWithin limits request use = do
   either throwIO pure (validateRequest request)
@@ -126,7 +137,7 @@ withResponseWithin limits request use = do
   -- it; connectWithin closes what it opened when it is stopped.
   mask $ \restore -> do
     socket <- restore (connectWithin limits.connectTimeout request.host request.port)
-    restore (withResponseOver (limitTransport limits.idleTimeout (socketTransport socket)) request use) `finally` Net.close socket
+    restore (withResponseOver limits (socketTransport socket) request use) `finally` Net.close socket
 
 -- | Like 'fetch', within other limits than 'defaultLimits'.
 fetchWithin :: Limits -> Request -> IO (Response (Array Word8))
@@ -160,24 +171,24 @@ limitTransport (Just microseconds) transport =
     within :: IO a -> IO a
     within action = timeout microseconds action >>= maybe (throwIO ResponseTimedOut) pure
 
--- | Like 'withResponse', over a connection that is already open. No time
--- limit is applied: see 'limitTransport'. The host
--- and the port of the request only serve its @Host@ header. The request
--- asks the server to close the connection after the response: one
--- exchange for each transport. Opening and closing it are up to the
--- caller.
-withResponseOver :: Transport -> Request -> (Response (Stream IO (Array Word8)) -> IO a) -> IO a
-withResponseOver transport request use = do
+-- | Like 'withResponseWithin', over a connection that is already open:
+-- the limits apply, except the time to connect. The host and the port of
+-- the request only serve its @Host@ header. The request asks the server
+-- to close the connection after the response: one exchange for each
+-- transport. Opening and closing it are up to the caller.
+withResponseOver :: Limits -> Transport -> Request -> (Response (Stream IO (Array Word8)) -> IO a) -> IO a
+withResponseOver limits transport request use = do
   either throwIO pure (validateRequest request)
-  Stream.fold (Fold.drainMapM transport.send) (renderRequest closing)
-  response <- readResponse request.method (StreamK.fromStream transport.receive)
+  Stream.fold (Fold.drainMapM limited.send) (renderRequest closing)
+  response <- readResponseWithin limits.maxHeadSize limits.maxBodySize request.method (StreamK.fromStream limited.receive)
   use response
   where
+    limited = limitTransport limits.idleTimeout transport
     closing = withHeaders (filter (\(name, _) -> BS8.map toLower name /= "connection") request.headers <> [("Connection", "close")]) request
 
--- | Like 'fetch', over a connection that is already open.
-fetchOver :: Transport -> Request -> IO (Response (Array Word8))
-fetchOver transport request = withResponseOver transport request collect
+-- | Like 'fetchWithin', over a connection that is already open.
+fetchOver :: Limits -> Transport -> Request -> IO (Response (Array Word8))
+fetchOver limits transport request = withResponseOver limits transport request collect
 
 collect :: Response (Stream IO (Array Word8)) -> IO (Response (Array Word8))
 collect response = do

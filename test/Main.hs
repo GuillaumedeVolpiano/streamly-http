@@ -4,7 +4,7 @@ module Main (main) where
 
 import Control.Concurrent.Async (wait, withAsync)
 import Control.Concurrent (threadDelay)
-import Control.Exception (bracket, catch, try)
+import Control.Exception (bracket, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
@@ -20,7 +20,7 @@ import Streamly.Data.StreamK qualified as StreamK
 import Streamly.External.ByteString qualified as StreamlyBS
 import Streamly.External.Network.HTTP
 import Streamly.External.Network.HTTP.URL
-import Streamly.External.Network.HTTP.Wire (readResponse, readResponseHead, renderRequest, validateRequest)
+import Streamly.External.Network.HTTP.Wire (readResponseHead, readResponseWithin, renderRequest, validateRequest)
 import Test.Tasty (TestTree, defaultMain, localOption, mkTimeout, testGroup)
 import System.Timeout (timeout)
 import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
@@ -45,8 +45,15 @@ readWhole :: Int -> ByteString -> IO (Response ByteString)
 readWhole = readWholeFor "GET"
 
 readWholeFor :: ByteString -> Int -> ByteString -> IO (Response ByteString)
-readWholeFor method size bytes = do
-  response <- readResponse method (StreamK.fromStream (Stream.fromList (map StreamlyBS.toArray (pieces size bytes))))
+readWholeFor = readWholeLimited Nothing Nothing
+
+-- | Like 'readWhole', with the largest head and the largest body accepted.
+readWholeWithin :: Maybe Int -> Maybe Int -> Int -> ByteString -> IO (Response ByteString)
+readWholeWithin maxHead maxBody = readWholeLimited maxHead maxBody "GET"
+
+readWholeLimited :: Maybe Int -> Maybe Int -> ByteString -> Int -> ByteString -> IO (Response ByteString)
+readWholeLimited maxHead maxBody method size bytes = do
+  response <- readResponseWithin maxHead maxBody method (StreamK.fromStream (Stream.fromList (map StreamlyBS.toArray (pieces size bytes))))
   content <- collect response.body
   pure (content <$ response)
 
@@ -74,7 +81,10 @@ isMalformed action = do
     Right _ -> assertFailure "no error, expected MalformedResponse"
 
 fixed :: ByteString
-fixed = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 11\r\n\r\nhello world"
+fixed = fixedHead <> "hello world"
+
+fixedHead :: ByteString
+fixedHead = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 11\r\n\r\n"
 
 chunked :: ByteString
 chunked =
@@ -126,6 +136,37 @@ reading =
       (found.status, header "upgrade" found) @?= (101, Just "websocket")
       following <- collect (StreamK.toStream rest)
       following @?= "\129\5hello"
+  , testProperty "a head of exactly the size allowed is read, with its body, however the bytes are cut" $ \(Positive size) ->
+      ioProperty $ do
+        response <- readWholeWithin (Just (BS.length fixedHead)) Nothing size fixed
+        pure (response.body === "hello world")
+  , testProperty "a head one byte longer than allowed is refused, however the bytes are cut" $ \(Positive size) ->
+      ioProperty $ do
+        outcome <- try (readWholeWithin (Just (BS.length fixedHead - 1)) Nothing size fixed)
+        pure (fmap (.status) outcome === Left (HeadTooLarge (BS.length fixedHead - 1)))
+  , testCase "headers without end are refused" $ do
+      let endless = "HTTP/1.1 200 OK\r\n" <> BS.concat (replicate 10_000 "X-Padding: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n")
+      failsWith (HeadTooLarge 65536) (readWholeWithin (Just 65536) Nothing 4096 endless)
+  , testCase "the size allowed to the head counts the interim responses" $ do
+      let interim = "HTTP/1.1 100 Continue\r\n\r\n"
+      response <- readWholeWithin (Just (BS.length interim + BS.length fixedHead)) Nothing 5 (interim <> fixed)
+      response.body @?= "hello world"
+      failsWith (HeadTooLarge (BS.length fixedHead)) (readWholeWithin (Just (BS.length fixedHead)) Nothing 5 (interim <> fixed))
+  , testCase "a body of the size allowed is read, a longer one refused: announced, chunked, until the end" $ do
+      let untilEnd = "HTTP/1.0 200 OK\r\n\r\nhello world"
+      announced <- readWholeWithin Nothing (Just 11) 4 fixed
+      announced.body @?= "hello world"
+      failsWith (BodyTooLarge 10) (readWholeWithin Nothing (Just 10) 4 fixed)
+      inChunks <- readWholeWithin Nothing (Just 16) 4 chunked
+      inChunks.body @?= "hello world12345"
+      failsWith (BodyTooLarge 15) (readWholeWithin Nothing (Just 15) 4 chunked)
+      toTheEnd <- readWholeWithin Nothing (Just 11) 4 untilEnd
+      toTheEnd.body @?= "hello world"
+      failsWith (BodyTooLarge 10) (readWholeWithin Nothing (Just 10) 4 untilEnd)
+  , testCase "too long a body that is announced is refused before it is read" $ do
+      -- Only the head is given: reading a body would fail otherwise.
+      outcome <- try (readResponseWithin Nothing (Just 10) "GET" (StreamK.fromStream (Stream.fromList [StreamlyBS.toArray fixedHead])))
+      fmap (.status) outcome @?= Left (BodyTooLarge 10)
   , testCase "a body cut short" $
       failsWith (TruncatedBody 5) (readWhole 4 "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello ")
   , testCase "a chunk cut short" $
@@ -287,7 +328,7 @@ withServer answer action =
 
 -- | Limits short enough for the tests.
 quick :: Limits
-quick = Limits {connectTimeout = Just 2_000_000, idleTimeout = Just 150_000}
+quick = defaultLimits {connectTimeout = Just 2_000_000, idleTimeout = Just 150_000}
 
 -- | A server that reads the request, sends the pieces of an answer with a
 -- pause in microseconds before each, then holds the connection open.
@@ -338,7 +379,7 @@ overTcp =
       sent <- newIORef []
       let answer = map StreamlyBS.toArray ["HTTP/1.1 200 OK\r\nContent-Le", "ngth: 5\r\n\r\nhel", "lo"]
           transport = Transport {send = \array -> modifyIORef sent (StreamlyBS.fromArray array :), receive = Stream.fromList answer}
-      response <- fetchOver transport (get "example.org" 443 "/secure")
+      response <- fetchOver defaultLimits transport (get "example.org" 443 "/secure")
       (response.status, StreamlyBS.fromArray response.body) @?= (200, "hello")
       request <- BS.concat . reverse <$> readIORef sent
       request @?= "GET /secure HTTP/1.1\r\nHost: example.org:443\r\nConnection: close\r\n\r\n"
@@ -368,20 +409,29 @@ overTcp =
   , testCase "a limited transport bounds receiving and sending" $ do
       let silent = Transport {send = \_ -> pure (), receive = Stream.repeatM (threadDelay 5_000_000 >> pure (StreamlyBS.toArray ""))}
           deaf = Transport {send = \_ -> threadDelay 5_000_000, receive = Stream.nil}
-      failsWith ResponseTimedOut (fetchOver (limitTransport (Just 50_000) silent) (get "example.org" 80 "/"))
-      failsWith ResponseTimedOut (fetchOver (limitTransport (Just 50_000) deaf) (get "example.org" 80 "/"))
+      failsWith ResponseTimedOut (fetchOver noLimits (limitTransport (Just 50_000) silent) (get "example.org" 80 "/"))
+      failsWith ResponseTimedOut (fetchOver noLimits (limitTransport (Just 50_000) deaf) (get "example.org" 80 "/"))
+      failsWith ResponseTimedOut (fetchOver noLimits {idleTimeout = Just 50_000} silent (get "example.org" 80 "/"))
   , testCase "connecting gives up in time" $ do
       -- An address that answers nothing where it is routed, and is refused
       -- at once where it is not: either way the wait is bounded.
       before <- getMonotonicTime
-      outcome <- try (connectWithin (Just 200_000) "10.255.255.1" 81)
+      outcome <- try (try (connectWithin (Just 200_000) "10.255.255.1" 81))
       after <- getMonotonicTime
       case outcome of
-        Left ConnectTimedOut -> pure ()
-        Left other -> assertFailure ("expected ConnectTimedOut, got " <> show other)
-        Right socket -> Net.close socket
-        `catch` \(_ :: IOError) -> pure ()
+        Left (_ :: IOError) -> pure ()
+        Right (Left ConnectTimedOut) -> pure ()
+        Right (Left other) -> assertFailure ("expected ConnectTimedOut, got " <> show other)
+        Right (Right socket) -> Net.close socket
       assertBool ("waited " <> show (after - before) <> " s") (after - before < 2)
+  , testCase "the sizes allowed apply over TCP" $ do
+      let answer = ["HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n", "01234567890123456789"]
+      (_, tooLong) <- withServer answer $ \port -> try (fetchWithin defaultLimits {maxBodySize = Just 19} (get "127.0.0.1" port "/"))
+      fmap (.status) tooLong @?= Left (BodyTooLarge 19)
+      (_, fits) <- withServer answer $ \port -> fetchWithin defaultLimits {maxBodySize = Just 20} (get "127.0.0.1" port "/")
+      StreamlyBS.fromArray fits.body @?= "01234567890123456789"
+      (_, longHead) <- withServer answer $ \port -> try (fetchWithin defaultLimits {maxHeadSize = Just 20} (get "127.0.0.1" port "/"))
+      fmap (.status) longHead @?= Left (HeadTooLarge 20)
   , testCase "an invalid request is refused before any connection" $
       failsWithInvalid (fetch (get "127.0.0.1" 1 "/a b"))
   , testCase "nothing listening is an IOError" $ do
