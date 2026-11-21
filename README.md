@@ -84,3 +84,9 @@ main = withClient defaultLimits $ \client -> do
   whole exchange is not bounded: use `System.Timeout.timeout`. The body is
   not either by default: set `maxBodySize` when the server is not trusted.
 - A status is never an error: look at `status`.
+
+## Building
+
+[streamly-network-tcp](https://github.com/GuillaumedeVolpiano/streamly-network-tcp) is not on Hackage yet: `cabal.project` fetches it from GitHub, at its
+release. To build against a copy checked out next to this repository
+instead, pass `--project-file=cabal.project.siblings`.

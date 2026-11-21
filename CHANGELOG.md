@@ -15,6 +15,8 @@
   request to the next (`withResponseIn`, `fetchIn`), and opens another
   when the server has closed it; `withSessionOver` for other transports.
   `readResponseReusable` tells where a response ends on its connection.
+* Built on streamly-network-tcp, which now holds `Transport`,
+  `socketTransport` and `connect`; they are still exported from here.
 * Clients: `withClient` keeps sessions for every server asked
   (`withResponseFrom`, `fetchFrom`), several for one server when requests
   overlap; `withClientOver` for other transports.

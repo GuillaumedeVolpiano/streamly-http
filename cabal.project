@@ -1,0 +1,10 @@
+packages: .
+
+-- The library this package is built on is not on Hackage yet: it is
+-- fetched from GitHub, at its release. To build against a copy checked out
+-- next to this repository instead, see cabal.project.siblings.
+
+source-repository-package
+  type: git
+  location: https://github.com/GuillaumedeVolpiano/streamly-network-tcp
+  tag: v0.1.0.0

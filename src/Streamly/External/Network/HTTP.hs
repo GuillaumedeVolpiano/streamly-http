@@ -62,6 +62,7 @@ module Streamly.External.Network.HTTP
     -- * Other transports
   , Transport (..)
   , socketTransport
+  , opened
   , limitTransport
   , withResponseOver
   , fetchOver
@@ -73,7 +74,7 @@ module Streamly.External.Network.HTTP
   ) where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, putMVar, readMVar, takeMVar)
-import Control.Exception (IOException, SomeException, bracket, bracketOnError, finally, fromException, mask, mask_, onException, throwIO, try)
+import Control.Exception (IOException, SomeException, bracket, finally, fromException, mask, mask_, onException, throwIO, try)
 import Control.Monad (void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
@@ -91,8 +92,9 @@ import Streamly.Data.Stream (Stream)
 import Streamly.Data.Stream qualified as Stream
 import Streamly.Data.StreamK qualified as StreamK
 import Streamly.External.Network.HTTP.URL (Scheme (..))
+import Streamly.External.Network.TCP (Transport (..), connect, opened, socketTransport)
+import Streamly.External.Network.TCP qualified as TCP
 import Streamly.External.Network.HTTP.Wire
-import Streamly.Network.Socket qualified as Socket
 import System.Timeout (timeout)
 
 -- | A @GET@ request for a target on a host and a port, without headers.
@@ -165,20 +167,6 @@ withResponseWithin limits request use = do
 fetchWithin :: Limits -> Request -> IO (Response (Array Word8))
 fetchWithin limits request = withResponseWithin limits request collect
 
--- | A connection that is already open, as the two things an exchange
--- needs. It lets a request go over something other than plain TCP: a TLS
--- connection, for HTTPS.
-data Transport = Transport
-  { send :: Array Word8 -> IO ()
-  -- ^ Send bytes.
-  , receive :: Stream IO (Array Word8)
-  -- ^ The bytes received, until the other side ends the connection.
-  }
-
--- | A TCP socket as a transport.
-socketTransport :: Net.Socket -> Transport
-socketTransport socket = Transport {send = Socket.putChunk socket, receive = Socket.readChunks socket}
-
 -- | The same transport, with a limit in microseconds on each wait: for
 -- the next bytes received, and for bytes to be sent. Exceeding it throws
 -- 'ResponseTimedOut'. 'Nothing' changes nothing.
@@ -236,12 +224,7 @@ data Live = Live
 -- reuse one connection when they can, instead of opening one each: see
 -- 'withResponseIn'. The connection kept is closed at the end.
 withSession :: Limits -> String -> Int -> (Session -> IO a) -> IO a
-withSession limits host port = withSessionOver limits $ do
-  socket <- connectWithin limits.connectTimeout host port
-  -- On a connection that is reused, a request held back until the last
-  -- response is acknowledged costs tens of milliseconds each time.
-  Net.setSocketOption socket Net.NoDelay 1
-  pure (socketTransport socket, Net.close socket)
+withSession limits host port = withSessionOver limits (connectWithin limits.connectTimeout host port >>= opened)
 
 -- | Like 'withSession', with the way to open a connection to the server
 -- left to an action, which gives a transport and what closes it: for TLS,
@@ -284,11 +267,7 @@ maxIdleSessions = 4
 withClient :: Limits -> (Client -> IO a) -> IO a
 withClient limits = withClientOver limits $ \scheme host port -> case scheme of
   Https -> throwIO (InvalidRequest "this client only speaks in clear")
-  Http -> do
-    socket <- connectWithin limits.connectTimeout host port
-    -- See withSession.
-    Net.setSocketOption socket Net.NoDelay 1
-    pure (socketTransport socket, Net.close socket)
+  Http -> connectWithin limits.connectTimeout host port >>= opened
 
 -- | Like 'withClient', with the way to open a connection to a server left
 -- to a function of the scheme, the host and the port, which gives a
@@ -417,30 +396,7 @@ collect response = do
   bytes <- Stream.fold Array.create (Stream.unfoldEach Array.reader response.body)
   pure (bytes <$ response)
 
--- | Open a TCP connection to a host and a port: to the first address of
--- the host that accepts it. Throws 'IOError'.
-connect :: String -> Int -> IO Net.Socket
-connect = connectWithin Nothing
-
 -- | Like 'connect', within a number of microseconds for the whole of it,
 -- name resolution included. Throws 'ConnectTimedOut' beyond.
 connectWithin :: Maybe Int -> String -> Int -> IO Net.Socket
-connectWithin limit host port = case limit of
-  Nothing -> open
-  Just microseconds -> timeout microseconds open >>= maybe (throwIO ConnectTimedOut) pure
-  where
-    open = do
-      addresses <- Net.getAddrInfo (Just hints) (Just host) (Just (show port))
-      attempt addresses
-    hints = Net.defaultHints {Net.addrSocketType = Net.Stream}
-    attempt [] = throwIO (userError ("no address for " <> host))
-    attempt (address : others) = do
-      outcome <- try (to address)
-      case (outcome, others) of
-        (Right socket, _) -> pure socket
-        (Left (problem :: IOException), []) -> throwIO problem
-        (Left _, _) -> attempt others
-    to address =
-      bracketOnError (Net.openSocket address) Net.close $ \socket -> do
-        Net.connect socket (Net.addrAddress address)
-        pure socket
+connectWithin limit host port = TCP.connectWithin limit host port >>= maybe (throwIO ConnectTimedOut) pure

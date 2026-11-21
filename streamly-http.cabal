@@ -49,9 +49,9 @@ library
     , bytestring           ^>=0.12
     , containers           ^>=0.7
     , network              ^>=3.2
-    , streamly             ^>=0.11.1
     , streamly-bytestring  ^>=0.2.3
     , streamly-core        ^>=0.3.3
+    , streamly-network-tcp ^>=0.1
 
 test-suite streamly-http-test
   import:         shared
