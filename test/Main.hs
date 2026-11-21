@@ -16,7 +16,7 @@ import Streamly.Data.Stream qualified as Stream
 import Streamly.Data.StreamK qualified as StreamK
 import Streamly.External.ByteString qualified as StreamlyBS
 import Streamly.External.Network.HTTP
-import Streamly.External.Network.HTTP.Wire (readResponse, renderRequest, validateRequest)
+import Streamly.External.Network.HTTP.Wire (readResponse, readResponseHead, renderRequest, validateRequest)
 import Test.Tasty (TestTree, defaultMain, localOption, mkTimeout, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
 import Test.Tasty.QuickCheck (Positive (..), ioProperty, testProperty, (===))
@@ -114,6 +114,12 @@ reading =
   , testCase "interim responses are skipped" $ do
       response <- readWhole 6 ("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n" <> fixed)
       (response.status, response.body) @?= (200, "hello world")
+  , testCase "the head alone, with what follows a switch of protocols" $ do
+      let input = StreamK.fromStream (Stream.fromList (map StreamlyBS.toArray (pieces 9 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n\129\5hello")))
+      (found, rest) <- readResponseHead input
+      (found.status, header "upgrade" found) @?= (101, Just "websocket")
+      following <- collect (StreamK.toStream rest)
+      following @?= "\129\5hello"
   , testCase "a body cut short" $
       failsWith (TruncatedBody 5) (readWhole 4 "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello ")
   , testCase "a chunk cut short" $
@@ -153,25 +159,25 @@ writing :: [TestTree]
 writing =
   [ testCase "a GET" $ do
       bytes <- rendered (withHeaders [("Accept", "image/jpeg")] (get "example.org" 8080 "/a?b=c"))
-      bytes @?= "GET /a?b=c HTTP/1.1\r\nHost: example.org:8080\r\nAccept: image/jpeg\r\nConnection: close\r\n\r\n"
+      bytes @?= "GET /a?b=c HTTP/1.1\r\nHost: example.org:8080\r\nAccept: image/jpeg\r\n\r\n"
   , testCase "the Host header leaves out port 80 and brackets an IPv6 address" $ do
       plain <- rendered (get "example.org" 80 "/")
-      plain @?= "GET / HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n"
+      plain @?= "GET / HTTP/1.1\r\nHost: example.org\r\n\r\n"
       v6 <- rendered (get "::1" 9330 "/")
-      v6 @?= "GET / HTTP/1.1\r\nHost: [::1]:9330\r\nConnection: close\r\n\r\n"
+      v6 @?= "GET / HTTP/1.1\r\nHost: [::1]:9330\r\n\r\n"
   , testCase "a Host given by the caller is kept, the framing headers are not" $ do
-      bytes <- rendered (withHeaders [("host", "virtual"), ("Content-Length", "99"), ("connection", "keep-alive")] (get "127.0.0.1" 80 "/"))
-      bytes @?= "GET / HTTP/1.1\r\nhost: virtual\r\nConnection: close\r\n\r\n"
+      bytes <- rendered (withHeaders [("host", "virtual"), ("Content-Length", "99"), ("connection", "Upgrade")] (get "127.0.0.1" 80 "/"))
+      bytes @?= "GET / HTTP/1.1\r\nhost: virtual\r\nconnection: Upgrade\r\n\r\n"
   , testCase "a body in bytes" $ do
       bytes <- rendered (withBody (BodyBytes "hello") (get "h" 80 "/") {method = "POST"})
-      bytes @?= "POST / HTTP/1.1\r\nHost: h\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello"
+      bytes @?= "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello"
   , testCase "an empty body in bytes still announces its length" $ do
       bytes <- rendered (withBody (BodyBytes "") (get "h" 80 "/") {method = "POST"})
-      bytes @?= "POST / HTTP/1.1\r\nHost: h\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+      bytes @?= "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"
   , testCase "a body in a stream is chunked, empty arrays left out" $ do
       let chunks = Stream.fromList (map StreamlyBS.toArray ["hello", "", "0123456789abcdef"])
       bytes <- rendered (withBody (BodyStream chunks) (get "h" 80 "/") {method = "PUT"})
-      bytes @?= "PUT / HTTP/1.1\r\nHost: h\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n"
+      bytes @?= "PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n"
   , testCase "requests that would run a field into the next are refused" $ do
       let refused request = case validateRequest request of
             Left (InvalidRequest _) -> pure ()
@@ -232,6 +238,11 @@ overTcp =
       (_, arrays) <- withServer answer $ \port ->
         withResponse (get "localhost" port "/") $ \response -> map StreamlyBS.fromArray <$> Stream.toList response.body
       BS.concat arrays @?= "abcde"
+  , testCase "the client closes the connection, whatever the request says" $ do
+      (request, _) <- withServer ["HTTP/1.1 204 No Content\r\n\r\n"] $ \port ->
+        fetch (withHeaders [("connection", "keep-alive")] (get "127.0.0.1" port "/"))
+      BS.drop (BS.length request - 23) request @?= "\r\nConnection: close\r\n\r\n"
+      BS.isInfixOf "keep-alive" request @?= False
   , testCase "a status is not an error" $ do
       (_, response) <- withServer ["HTTP/1.1 400 Bad Request\r\nContent-Length: 20\r\n\r\nInvalid Scale: bogus"] $ \port ->
         fetch (get "127.0.0.1" port "/")

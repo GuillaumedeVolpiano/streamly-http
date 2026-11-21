@@ -21,6 +21,7 @@ module Streamly.External.Network.HTTP.Wire
   , Response (..)
   , header
   , readResponse
+  , readResponseHead
 
     -- * Errors
   , HttpError (..)
@@ -53,9 +54,9 @@ type Header = (ByteString, ByteString)
 
 -- | A request to one server.
 --
--- 'renderRequest' adds @Host@ (unless given here), @Connection: close@ and
--- the header that delimits the body; @Connection@, @Content-Length@ and
--- @Transfer-Encoding@ given here are dropped.
+-- 'renderRequest' adds @Host@ (unless given here) and the header that
+-- delimits the body; @Content-Length@ and @Transfer-Encoding@ given here
+-- are dropped.
 data Request = Request
   { method :: ByteString
   -- ^ For example @GET@.
@@ -151,11 +152,11 @@ renderRequest request = case request.body of
     headWith framing =
       StreamlyBS.toArray . BS.concat $
         [request.method, " ", request.target, " HTTP/1.1\r\n"]
-          <> concatMap line (hostHeader <> kept <> [("Connection", "close")] <> framing)
+          <> concatMap line (hostHeader <> kept <> framing)
           <> ["\r\n"]
     line (name, value) = [name, ": ", value, "\r\n"]
     kept = filter (\(name, _) -> lowerAscii name `notElem` owned) request.headers
-    owned = ["connection", "content-length", "transfer-encoding"]
+    owned = ["content-length", "transfer-encoding"]
     hostHeader
       | any (\(name, _) -> lowerAscii name == "host") request.headers = []
       | otherwise = [("Host", authority)]
@@ -181,12 +182,21 @@ renderRequest request = case request.body of
 -- Throws 'HttpError': here for the head, from the stream for the body.
 readResponse :: ByteString -> StreamK IO (Array Word8) -> IO (Response (Stream IO (Array Word8)))
 readResponse method input = do
+  (found, rest) <- readResponseHead input
+  framing <- either throwIO pure (bodyFraming method found)
+  pure (bodyStream framing rest <$ found)
+
+-- | Read the head of a response, and give what follows it in the input:
+-- the body, or after a status 101 the bytes of the protocol switched to.
+-- Interim responses (status 1xx, except 101) are skipped.
+--
+-- Throws 'MalformedResponse'.
+readResponseHead :: StreamK IO (Array Word8) -> IO (Response (), StreamK IO (Array Word8))
+readResponseHead input = do
   (found, rest) <- parseOrThrow responseHead input
   if found.status >= 100 && found.status < 200 && found.status /= 101
-    then readResponse method rest
-    else do
-      framing <- either throwIO pure (bodyFraming method found)
-      pure (bodyStream framing rest <$ found)
+    then readResponseHead rest
+    else pure (found, rest)
 
 -- | How the end of a body is found (RFC 9112, section 6.3).
 data Framing

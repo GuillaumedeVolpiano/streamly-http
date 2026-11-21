@@ -34,6 +34,7 @@ module Streamly.External.Network.HTTP
   , header
   , withResponse
   , fetch
+  , connect
 
     -- * Errors
   , HttpError (..)
@@ -41,6 +42,8 @@ module Streamly.External.Network.HTTP
 
 import Control.Exception (IOException, bracket, bracketOnError, throwIO, try)
 import Data.ByteString (ByteString)
+import Data.ByteString.Char8 qualified as BS8
+import Data.Char (toLower)
 import Data.Word (Word8)
 import Network.Socket qualified as Net
 import Streamly.Data.Array (Array)
@@ -63,15 +66,20 @@ get host port target = Request {method = "GET", host, port, target, headers = []
 -- it inside the function, and only once. The connection is closed when the
 -- function returns, whether the body was read to its end or not.
 --
+-- The request is sent with @Connection: close@, in place of any
+-- @Connection@ header of its own.
+--
 -- Throws 'HttpError' for a request that cannot be written and for a
 -- response that cannot be read, and 'IOError' when the connection fails.
 withResponse :: Request -> (Response (Stream IO (Array Word8)) -> IO a) -> IO a
 withResponse request use = do
   either throwIO pure (validateRequest request)
   bracket (connect request.host request.port) Net.close $ \socket -> do
-    Stream.fold (Socket.writeChunks socket) (renderRequest request)
+    Stream.fold (Socket.writeChunks socket) (renderRequest closing)
     response <- readResponse request.method (StreamK.fromStream (Socket.readChunks socket))
     use response
+  where
+    closing = withHeaders (filter (\(name, _) -> BS8.map toLower name /= "connection") request.headers <> [("Connection", "close")]) request
 
 -- | Send a request and read the whole response into memory.
 fetch :: Request -> IO (Response (Array Word8))
@@ -79,7 +87,8 @@ fetch request = withResponse request $ \response -> do
   bytes <- Stream.fold Array.create (Stream.unfoldEach Array.reader response.body)
   pure (bytes <$ response)
 
--- | Connect to the first address of the host that accepts the connection.
+-- | Open a TCP connection to a host and a port: to the first address of
+-- the host that accepts it. Throws 'IOError'.
 connect :: String -> Int -> IO Net.Socket
 connect host port = do
   addresses <- Net.getAddrInfo (Just hints) (Just host) (Just (show port))
