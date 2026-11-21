@@ -20,7 +20,7 @@ import Streamly.Data.StreamK qualified as StreamK
 import Streamly.External.ByteString qualified as StreamlyBS
 import Streamly.External.Network.HTTP
 import Streamly.External.Network.HTTP.URL
-import Streamly.External.Network.HTTP.Wire (readResponseHead, readResponseWithin, renderRequest, validateRequest)
+import Streamly.External.Network.HTTP.Wire (RequestHead (..), readRequestHeadWithin, readResponseHead, readResponseWithin, renderRequest, requestHeader, validateRequest)
 import Test.Tasty (TestTree, defaultMain, localOption, mkTimeout, testGroup)
 import System.Timeout (timeout)
 import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
@@ -167,6 +167,25 @@ reading =
       -- Only the head is given: reading a body would fail otherwise.
       outcome <- try (readResponseWithin Nothing (Just 10) "GET" (StreamK.fromStream (Stream.fromList [StreamlyBS.toArray fixedHead])))
       fmap (.status) outcome @?= Left (BodyTooLarge 10)
+  , testProperty "the head of a request is read, with what follows it, however the bytes are cut" $ \(Positive size) ->
+      ioProperty $ do
+        let bytes = "GET /chat?room=1 HTTP/1.1\r\nHost: example.org\r\nUpgrade:  websocket \r\nX-Empty:\r\n\r\n\129\5hello"
+        (found, rest) <- readRequestHeadWithin (Just 1000) (StreamK.fromStream (Stream.fromList (map StreamlyBS.toArray (pieces size bytes))))
+        following <- collect (StreamK.toStream rest)
+        pure
+          ( (found, requestHeader "UPGRADE" found, following)
+              === (RequestHead "GET" "/chat?room=1" [("host", "example.org"), ("upgrade", "websocket"), ("x-empty", "")], Just "websocket", "\129\5hello")
+          )
+  , testCase "what is not the head of a request, and one that is too long" $ do
+      let headOf limit bytes = readRequestHeadWithin limit (StreamK.fromStream (Stream.fromList (map StreamlyBS.toArray (pieces 7 bytes))))
+          malformed bytes =
+            try (headOf Nothing bytes) >>= \case
+              Left (MalformedRequest _) -> pure ()
+              Left other -> assertFailure ("expected MalformedRequest, got " <> show other)
+              Right (found, _) -> assertFailure ("accepted " <> show found)
+      mapM_ malformed ["", "GET / HTTP/1.1\r\nHost: x\r\n", "GET /a b HTTP/1.1\r\n\r\n", "GET / HTTP/2\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n", "GET /\r\n\r\n", "GET / HTTP/1.1\r\nno colon\r\n\r\n"]
+      outcome <- try (headOf (Just 20) "GET / HTTP/1.1\r\nHost: example.org\r\n\r\n")
+      fmap fst outcome @?= Left (HeadTooLarge 20)
   , testCase "a body cut short" $
       failsWith (TruncatedBody 5) (readWhole 4 "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello ")
   , testCase "a chunk cut short" $

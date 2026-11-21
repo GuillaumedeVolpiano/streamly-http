@@ -25,11 +25,19 @@ module Streamly.External.Network.HTTP.Wire
   , readResponseHead
   , readResponseHeadWithin
 
+    -- * Requests, as a server reads them
+  , RequestHead (..)
+  , requestMethod
+  , requestTarget
+  , requestHeader
+  , readRequestHeadWithin
+
     -- * Errors
   , HttpError (..)
 
     -- * Parsers
   , responseHead
+  , requestHead
   , chunkSizeLine
   ) where
 
@@ -117,8 +125,11 @@ data HttpError
   | -- | The input ended inside the body: the number of bytes still expected
     -- (of the current chunk, for a chunked body).
     TruncatedBody Int
-  | -- | The head of the response is longer than allowed: the limit, in
-    -- bytes.
+  | -- | The head of a request could not be parsed, on the side of a
+    -- server: the reason given by the parser.
+    MalformedRequest String
+  | -- | The head of the response, or of the request on the side of a
+    -- server, is longer than allowed: the limit, in bytes.
     HeadTooLarge Int
   | -- | The body of the response is longer than allowed: the limit, in
     -- bytes.
@@ -225,8 +236,16 @@ readResponseHead = readResponseHeadWithin Nothing
 -- interim responses included; 'Nothing' accepts any. Throws 'HeadTooLarge'
 -- beyond.
 readResponseHeadWithin :: Maybe Int -> StreamK IO (Array Word8) -> IO (Response (), StreamK IO (Array Word8))
-readResponseHeadWithin Nothing input = headFrom input
-readResponseHeadWithin (Just limit) input = do
+readResponseHeadWithin limit = headWithin limit headFrom
+
+-- | Read a head with a reader, handing it no more bytes than allowed.
+headWithin
+  :: Maybe Int
+  -> (StreamK IO (Array Word8) -> IO (a, StreamK IO (Array Word8)))
+  -> StreamK IO (Array Word8)
+  -> IO (a, StreamK IO (Array Word8))
+headWithin Nothing reader input = reader input
+headWithin (Just limit) reader input = do
   -- The bytes the head may still take; Nothing once the head is read.
   allowance <- newIORef (Just limit)
   let step from =
@@ -246,9 +265,40 @@ readResponseHeadWithin (Just limit) input = do
                     let (front, back) = BS.splitAt left (StreamlyBS.fromArray array)
                     writeIORef allowance (Just 0)
                     pure (Just (StreamlyBS.toArray front, StreamK.cons (StreamlyBS.toArray back) rest))
-  (found, rest) <- headFrom (StreamK.fromStream (Stream.unfoldrM step input))
+  (found, rest) <- reader (StreamK.fromStream (Stream.unfoldrM step input))
   writeIORef allowance Nothing
   pure (found, rest)
+
+-- | The head of a request, as a server receives it: the method, the
+-- target, and the headers with their names in lower case. (Without field
+-- names, which would make updates of a 'Request' ambiguous.)
+data RequestHead = RequestHead ByteString ByteString [Header]
+  deriving stock (Eq, Show)
+
+-- | The method of a request received, such as @GET@.
+requestMethod :: RequestHead -> ByteString
+requestMethod (RequestHead method _ _) = method
+
+-- | The target of a request received: its path and its query.
+requestTarget :: RequestHead -> ByteString
+requestTarget (RequestHead _ target _) = target
+
+-- | The first header of that name in the head of a request, whatever the
+-- case of the name.
+requestHeader :: ByteString -> RequestHead -> Maybe ByteString
+requestHeader name (RequestHead _ _ headers) = lookup (lowerAscii name) headers
+
+-- | Read the head of a request, with the largest head accepted, in bytes
+-- ('Nothing' accepts any), and give what follows it in the input: the
+-- body, or after an upgrade the bytes of the protocol switched to.
+--
+-- Throws 'MalformedRequest', and 'HeadTooLarge' beyond the limit.
+readRequestHeadWithin :: Maybe Int -> StreamK IO (Array Word8) -> IO (RequestHead, StreamK IO (Array Word8))
+readRequestHeadWithin limit = headWithin limit $ \input -> do
+  (outcome, rest) <- Array.parseBreak (Array.toParserK requestHead) input
+  case outcome of
+    Left (Parser.ParseError problem) -> throwIO (MalformedRequest problem)
+    Right found -> pure (found, rest)
 
 headFrom :: StreamK IO (Array Word8) -> IO (Response (), StreamK IO (Array Word8))
 headFrom input = do
@@ -348,12 +398,30 @@ responseHead = do
   found <- Parser.many headerLine Fold.toList
   lineEnd
   pure Response {status = foldl' (\total digit -> total * 10 + fromIntegral (digit - 48)) 0 digits, reason, headers = found, body = ()}
-  where
-    headerLine = do
-      name <- Parser.takeWhile1 isTokenByte Fold.toList
-      void (Parser.satisfy (== colon))
-      value <- restOfLine
-      pure (lowerAscii (BS.pack name), value)
+
+-- | The request line, the header lines and the empty line that ends them,
+-- read as 'responseHead' reads those of a response.
+requestHead :: Monad m => Parser Word8 m RequestHead
+requestHead = do
+  method <- Parser.takeWhile1 isTokenByte Fold.toList
+  void (Parser.satisfy (== space))
+  target <- Parser.takeWhile1 (\byte -> byte > space && byte /= 127) Fold.toList
+  void (Parser.satisfy (== space))
+  void (Parser.listEq (BS.unpack "HTTP/1."))
+  void (Parser.satisfy isDigit)
+  lineEnd
+  found <- Parser.many headerLine Fold.toList
+  lineEnd
+  pure (RequestHead (BS.pack method) (BS.pack target) found)
+
+-- | A header line: its name in lower case, and its value without the
+-- spaces around it.
+headerLine :: Monad m => Parser Word8 m Header
+headerLine = do
+  name <- Parser.takeWhile1 isTokenByte Fold.toList
+  void (Parser.satisfy (== colon))
+  value <- restOfLine
+  pure (lowerAscii (BS.pack name), value)
 
 -- | The line that starts a chunk: its size in hexadecimal, then extensions
 -- that are ignored.

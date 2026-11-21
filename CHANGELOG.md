@@ -11,6 +11,8 @@
   by default). `readResponseWithin` and `readResponseHeadWithin` take them
   at the level of the message format.
 * `withResponseOver` and `fetchOver` take the `Limits`.
+* The head of a request, as a server reads it: `RequestHead`,
+  `readRequestHeadWithin`. `HttpError` gains `MalformedRequest`.
 * `HttpError` gains `ConnectTimedOut`, `ResponseTimedOut`, `HeadTooLarge`
   and `BodyTooLarge`.
 

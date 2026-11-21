@@ -30,7 +30,9 @@ main = do
 - `Streamly.External.Network.HTTP`: the client over TCP (`get`, `fetch`,
   `withResponse`).
 - `Streamly.External.Network.HTTP.Wire`: the message format alone
-  (`renderRequest`, `readResponse`), to run it over another transport.
+  (`renderRequest`, `readResponse`), to run it over another transport. It
+  also reads the head of a request, for the servers of protocols that
+  start with an HTTP exchange.
 - `Streamly.External.Network.HTTP.URL`: `http` and `https` URLs, read,
   written back and resolved against one another.
 
