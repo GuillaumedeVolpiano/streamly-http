@@ -42,24 +42,25 @@ module Streamly.External.Network.HTTP.Wire
   , chunkSizeLine
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Exception (Exception, throwIO, try)
 import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Maybe (fromMaybe)
 import Data.Word (Word8)
+import FlatParse.Basic qualified as FP
 import Numeric (showHex)
 import Streamly.Data.Array (Array)
 import Streamly.Data.Array qualified as Array
-import Streamly.Data.Fold qualified as Fold
-import Streamly.Data.Parser (Parser)
-import Streamly.Data.Parser qualified as Parser
 import Streamly.Data.Stream (Stream)
 import Streamly.Data.Stream qualified as Stream
 import Streamly.Data.StreamK (StreamK)
 import Streamly.Data.StreamK qualified as StreamK
 import Streamly.External.ByteString qualified as StreamlyBS
+import Streamly.External.FlatParse qualified as Flat
 
 -- | A header name and its value.
 type Header = (ByteString, ByteString)
@@ -178,9 +179,9 @@ renderRequest request = case request.body of
     headWith framing =
       StreamlyBS.toArray . BS.concat $
         [request.method, " ", request.target, " HTTP/1.1\r\n"]
-          <> concatMap line (hostHeader <> kept <> framing)
+          <> concatMap written (hostHeader <> kept <> framing)
           <> ["\r\n"]
-    line (name, value) = [name, ": ", value, "\r\n"]
+    written (name, value) = [name, ": ", value, "\r\n"]
     kept = filter (\(name, _) -> lowerAscii name `notElem` owned) request.headers
     owned = ["content-length", "transfer-encoding"]
     hostHeader
@@ -218,7 +219,7 @@ readResponse = readResponseWithin Nothing Nothing
 -- response announces too long a body, and from the stream otherwise.
 readResponseWithin :: Maybe Int -> Maybe Int -> ByteString -> StreamK IO (Array Word8) -> IO (Response (Stream IO (Array Word8)))
 readResponseWithin maxHead maxBody method input = do
-  ((_, found), rest) <- headWithin maxHead versionedHeadFrom input
+  ((_, found), rest) <- versionedHeadWithin maxHead input
   framing <- either throwIO pure (bodyFraming method found)
   case (framing, maxBody) of
     (Fixed announced, Just limit) | announced > limit -> throwIO (BodyTooLarge limit)
@@ -242,7 +243,7 @@ readResponseReusable
   -> StreamK IO (Array Word8)
   -> IO (Response (Stream IO (Array Word8)), IO (Maybe (StreamK IO (Array Word8))))
 readResponseReusable maxHead maxBody method input = do
-  ((minor, found), rest) <- headWithin maxHead versionedHeadFrom input
+  ((minor, found), rest) <- versionedHeadWithin maxHead input
   framing <- either throwIO pure (bodyFraming method found)
   case (framing, maxBody) of
     (Fixed announced, Just limit) | announced > limit -> throwIO (BodyTooLarge limit)
@@ -265,37 +266,8 @@ readResponseHead = readResponseHeadWithin Nothing
 -- interim responses included; 'Nothing' accepts any. Throws 'HeadTooLarge'
 -- beyond.
 readResponseHeadWithin :: Maybe Int -> StreamK IO (Array Word8) -> IO (Response (), StreamK IO (Array Word8))
-readResponseHeadWithin limit = headWithin limit headFrom
-
--- | Read a head with a reader, handing it no more bytes than allowed.
-headWithin
-  :: Maybe Int
-  -> (StreamK IO (Array Word8) -> IO (a, StreamK IO (Array Word8)))
-  -> StreamK IO (Array Word8)
-  -> IO (a, StreamK IO (Array Word8))
-headWithin Nothing reader input = reader input
-headWithin (Just limit) reader input = do
-  -- The bytes the head may still take; Nothing once the head is read.
-  allowance <- newIORef (Just limit)
-  let step from =
-        readIORef allowance >>= \case
-          Nothing -> StreamK.uncons from
-          Just 0 -> throwIO (HeadTooLarge limit)
-          Just left ->
-            StreamK.uncons from >>= \case
-              Nothing -> pure Nothing
-              Just (array, rest)
-                | Array.length array <= left -> do
-                    writeIORef allowance (Just (left - Array.length array))
-                    pure (Just (array, rest))
-                | otherwise -> do
-                    -- Hand over what the head may still take; the rest of
-                    -- the array waits, for the body if the head ends there.
-                    let (front, back) = BS.splitAt left (StreamlyBS.fromArray array)
-                    writeIORef allowance (Just 0)
-                    pure (Just (StreamlyBS.toArray front, StreamK.cons (StreamlyBS.toArray back) rest))
-  (found, rest) <- reader (StreamK.fromStream (Stream.unfoldrM step input))
-  writeIORef allowance Nothing
+readResponseHeadWithin limit input = do
+  ((_, found), rest) <- versionedHeadWithin limit input
   pure (found, rest)
 
 -- | The head of a request, as a server receives it: the method, the
@@ -323,25 +295,35 @@ requestHeader name (RequestHead _ _ headers) = lookup (lowerAscii name) headers
 --
 -- Throws 'MalformedRequest', and 'HeadTooLarge' beyond the limit.
 readRequestHeadWithin :: Maybe Int -> StreamK IO (Array Word8) -> IO (RequestHead, StreamK IO (Array Word8))
-readRequestHeadWithin limit = headWithin limit $ \input -> do
-  (outcome, rest) <- Array.parseBreak (Array.toParserK requestHead) input
-  case outcome of
-    Left (Parser.ParseError problem) -> throwIO (MalformedRequest problem)
-    Right found -> pure (found, rest)
-
-headFrom :: StreamK IO (Array Word8) -> IO (Response (), StreamK IO (Array Word8))
-headFrom input = do
-  ((_, found), rest) <- versionedHeadFrom input
-  pure (found, rest)
+readRequestHeadWithin limit = parsed MalformedRequest (HeadTooLarge allowed) allowed requestHead
+  where
+    allowed = fromMaybe maxBound limit
 
 -- | The head of a response with the minor version of its protocol: 0 for
--- HTTP\/1.0, 1 for HTTP\/1.1.
-versionedHeadFrom :: StreamK IO (Array Word8) -> IO ((Int, Response ()), StreamK IO (Array Word8))
-versionedHeadFrom input = do
-  (versioned@(_, found), rest) <- parseOrThrow versionedHead input
-  if found.status >= 100 && found.status < 200 && found.status /= 101
-    then versionedHeadFrom rest
-    else pure (versioned, rest)
+-- HTTP\/1.0, 1 for HTTP\/1.1. Interim responses are skipped; the bytes
+-- allowed are for all the heads read.
+versionedHeadWithin :: Maybe Int -> StreamK IO (Array Word8) -> IO ((Int, Response ()), StreamK IO (Array Word8))
+versionedHeadWithin limit = go allowed
+  where
+    allowed = fromMaybe maxBound limit
+    go budget input = do
+      ((size, versioned@(_, found)), rest) <- parsed MalformedResponse (HeadTooLarge allowed) budget (sized versionedHead) input
+      if found.status >= 100 && found.status < 200 && found.status /= 101
+        then go (budget - size) rest
+        else pure (versioned, rest)
+    sized parser = FP.withByteString parser (\found bytes -> pure (BS.length bytes, found))
+
+-- | Run a parser on the start of the input, which it may read no further
+-- than a number of bytes, and give what follows. Throws the error made of
+-- the reason when the input does not parse, and the other error when it
+-- would need more bytes than allowed.
+parsed :: (String -> HttpError) -> HttpError -> Int -> FP.Parser String a -> StreamK IO (Array Word8) -> IO (a, StreamK IO (Array Word8))
+parsed malformed tooLong limit parser input =
+  Flat.parseBreak limit parser input >>= \case
+    (Right found, rest) -> pure (found, rest)
+    (Left Flat.Mismatch, _) -> throwIO (malformed "the input ended too early")
+    (Left (Flat.ParserError problem), _) -> throwIO (malformed problem)
+    (Left (Flat.TooLong _), _) -> throwIO tooLong
 
 -- | Stop a body that grows beyond a number of bytes.
 limitBody :: Int -> Stream IO (Array Word8) -> Stream IO (Array Word8)
@@ -394,8 +376,10 @@ bodyStream after framing input = case framing of
   Chunked -> Stream.unfoldrM step (AtChunkSize input)
   where
     leave rest = mapM_ (\place -> writeIORef place (Just rest)) after
+    -- The lines between the chunks are short.
+    short = parsed MalformedResponse (MalformedResponse "a line between chunks that is too long") 4096
     step (AtChunkSize from) = do
-      (size, rest) <- parseOrThrow chunkSizeLine from
+      (size, rest) <- short chunkSizeLine from
       if size /= 0
         then step (InData size rest True)
         else do
@@ -405,12 +389,12 @@ bodyStream after framing input = case framing of
           case after of
             Nothing -> pure ()
             Just _ -> do
-              trailer <- try (parseOrThrow (Parser.many headerLine Fold.drain *> lineEnd) rest)
+              trailer <- try (parsed MalformedResponse (MalformedResponse "a trailer that is too long") 65536 (FP.skipMany headerLine *> lineEnd) rest)
               either (\(_ :: HttpError) -> pure ()) (leave . snd) trailer
           pure Nothing
     step (InData 0 from chunked)
       | chunked = do
-          ((), rest) <- parseOrThrow lineEnd from
+          ((), rest) <- short chunkEnd from
           step (AtChunkSize rest)
       | otherwise = Nothing <$ leave from
     step (InData remaining from chunked) = do
@@ -427,66 +411,70 @@ bodyStream after framing input = case framing of
           where
             size = Array.length array
 
-parseOrThrow :: Parser Word8 IO a -> StreamK IO (Array Word8) -> IO (a, StreamK IO (Array Word8))
-parseOrThrow parser input = do
-  (outcome, rest) <- Array.parseBreak (Array.toParserK parser) input
-  case outcome of
-    Left (Parser.ParseError problem) -> throwIO (MalformedResponse problem)
-    Right value -> pure (value, rest)
-
 -- | The status line, the header lines and the empty line that ends them.
 -- The names of the headers are given in lower case, the values without the
 -- spaces around them. Lines end with a line feed, after an optional
 -- carriage return. Header lines folded over several lines are refused.
-responseHead :: Monad m => Parser Word8 m (Response ())
+--
+-- Like the other parsers here, it fails while a line is not all there, so
+-- that it can be run with @parseBreak@ of @streamly-flatparse@ as the
+-- bytes come, and it stops on an error as soon as a whole line is wrong.
+responseHead :: FP.Parser String (Response ())
 responseHead = snd <$> versionedHead
 
 -- | 'responseHead', with the minor version of the protocol of the server.
-versionedHead :: Monad m => Parser Word8 m (Int, Response ())
+versionedHead :: FP.Parser String (Int, Response ())
 versionedHead = do
-  void (Parser.listEq (BS.unpack "HTTP/1."))
-  minor <- Parser.satisfy isDigit
-  void (Parser.satisfy (== space))
-  digits <- Parser.takeWhile1 isDigit Fold.toList
-  when (length digits /= 3) (Parser.die "the status code does not have three digits")
-  reason <- restOfLine
-  found <- Parser.many headerLine Fold.toList
+  (minor, status, reason) <- line "the first line is not the status line of HTTP/1" $ do
+    FP.byteString "HTTP/1."
+    minor <- digit
+    FP.word8 space
+    digits <- FP.byteStringOf (FP.skipSome (satisfyByte isDigit))
+    when (BS.length digits /= 3) FP.failed
+    reason <- trimmed <$> FP.takeRest
+    pure (minor, BS.foldl' (\total byte -> total * 10 + fromIntegral (byte - 48)) 0 digits, reason)
+  found <- FP.many headerLine
   lineEnd
-  pure (fromIntegral (minor - 48), Response {status = foldl' (\total digit -> total * 10 + fromIntegral (digit - 48)) 0 digits, reason, headers = found, body = ()})
+  pure (minor, Response {status, reason, headers = found, body = ()})
 
 -- | The request line, the header lines and the empty line that ends them,
 -- read as 'responseHead' reads those of a response.
-requestHead :: Monad m => Parser Word8 m RequestHead
+requestHead :: FP.Parser String RequestHead
 requestHead = do
-  method <- Parser.takeWhile1 isTokenByte Fold.toList
-  void (Parser.satisfy (== space))
-  target <- Parser.takeWhile1 (\byte -> byte > space && byte /= 127) Fold.toList
-  void (Parser.satisfy (== space))
-  void (Parser.listEq (BS.unpack "HTTP/1."))
-  void (Parser.satisfy isDigit)
+  (method, target) <- line "the first line is not the request line of HTTP/1" $ do
+    method <- FP.byteStringOf (FP.skipSome (satisfyByte isTokenByte))
+    FP.word8 space
+    target <- FP.byteStringOf (FP.skipSome (satisfyByte (\byte -> byte > space && byte /= 127)))
+    FP.word8 space
+    FP.byteString "HTTP/1."
+    void digit
+    FP.skipMany (FP.word8 carriageReturn)
+    pure (method, target)
+  found <- FP.many headerLine
   lineEnd
-  found <- Parser.many headerLine Fold.toList
-  lineEnd
-  pure (RequestHead (BS.pack method) (BS.pack target) found)
+  pure (RequestHead method target found)
 
 -- | A header line: its name in lower case, and its value without the
--- spaces around it.
-headerLine :: Monad m => Parser Word8 m Header
+-- spaces around it. Fails, without an error, on the empty line that ends
+-- the headers.
+headerLine :: FP.Parser String Header
 headerLine = do
-  name <- Parser.takeWhile1 isTokenByte Fold.toList
-  void (Parser.satisfy (== colon))
-  value <- restOfLine
-  pure (lowerAscii (BS.pack name), value)
+  FP.fails lineEnd
+  line "a header line is not a name, a colon and a value" $ do
+    name <- FP.byteStringOf (FP.skipSome (satisfyByte isTokenByte))
+    FP.word8 colon
+    value <- trimmed <$> FP.takeRest
+    pure (lowerAscii name, value)
 
 -- | The line that starts a chunk: its size in hexadecimal, then extensions
 -- that are ignored.
-chunkSizeLine :: Monad m => Parser Word8 m Int
-chunkSizeLine = do
-  digits <- Parser.takeWhile1 isHexDigit Fold.toList
+chunkSizeLine :: FP.Parser String Int
+chunkSizeLine = line "a chunk does not start with its size in hexadecimal" $ do
+  digits <- FP.byteStringOf (FP.skipSome (satisfyByte isHexDigit))
   -- Fifteen digits always fit in an Int.
-  when (length digits > 15) (Parser.die "the chunk size is too large")
-  void restOfLine
-  pure (foldl' (\total digit -> total * 16 + hexValue digit) 0 digits)
+  when (BS.length digits > 15) FP.failed
+  void FP.takeRest
+  pure (BS.foldl' (\total byte -> total * 16 + hexValue byte) 0 digits)
   where
     isHexDigit byte = isDigit byte || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)
     hexValue byte
@@ -494,19 +482,37 @@ chunkSizeLine = do
       | byte >= 97 = fromIntegral (byte - 87)
       | otherwise = fromIntegral (byte - 55)
 
--- | The bytes up to the end of the line, without the spaces around them.
-restOfLine :: Monad m => Parser Word8 m ByteString
-restOfLine = do
-  bytes <- Parser.takeWhile (/= lineFeed) Fold.toList
-  void (Parser.satisfy (== lineFeed))
-  pure (BS.dropWhile blank (BS.dropWhileEnd blank (BS.pack bytes)))
+-- | A whole line, read by a parser that must read all of it, the line
+-- feed left out. It fails while the line feed has not come, and stops on
+-- an error, with a reason, when the line is there and is not what the
+-- parser reads.
+line :: String -> FP.Parser String a -> FP.Parser String a
+line problem content = do
+  size <- FP.lookahead (BS.length <$> FP.byteStringOf (FP.skipMany (satisfyByte (/= lineFeed))) <* FP.word8 lineFeed)
+  found <- FP.isolate size content `FP.cut` problem
+  FP.word8 lineFeed
+  pure found
+
+-- | The end of a line: a line feed, after carriage returns if any.
+lineEnd :: FP.Parser String ()
+lineEnd = FP.skipMany (FP.word8 carriageReturn) *> FP.word8 lineFeed
+
+-- | The end of the line that follows the data of a chunk: an error if
+-- something else is there.
+chunkEnd :: FP.Parser String ()
+chunkEnd = FP.skipMany (FP.word8 carriageReturn) *> (FP.word8 lineFeed <|> (FP.lookahead FP.anyWord8 *> FP.err "the data of a chunk is not followed by a line end"))
+
+satisfyByte :: (Word8 -> Bool) -> FP.Parser String ()
+satisfyByte accepted = FP.anyWord8 >>= \byte -> if accepted byte then pure () else FP.failed
+
+digit :: FP.Parser String Int
+digit = FP.anyWord8 >>= \byte -> if isDigit byte then pure (fromIntegral (byte - 48)) else FP.failed
+
+-- | Without the spaces, the tabs and the carriage returns around.
+trimmed :: ByteString -> ByteString
+trimmed = BS.dropWhile blank . BS.dropWhileEnd blank
   where
     blank byte = byte == space || byte == tab || byte == carriageReturn
-
-lineEnd :: Monad m => Parser Word8 m ()
-lineEnd = do
-  Parser.dropWhile (== carriageReturn)
-  void (Parser.satisfy (== lineFeed))
 
 -- | The bytes allowed in a method or a header name (RFC 9110, tchar).
 isTokenByte :: Word8 -> Bool

@@ -22,18 +22,13 @@ module Streamly.External.Network.HTTP.URL
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (void, when)
+import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.Char (toLower)
-import Data.Functor.Identity (Identity (..))
 import Data.Word (Word8)
-import Streamly.Data.Fold qualified as Fold
-import Streamly.Data.Parser (Parser)
-import Streamly.Data.Parser qualified as Parser
-import Streamly.Data.Stream qualified as Stream
-import Streamly.External.ByteString qualified as StreamlyBS
+import FlatParse.Basic qualified as FP
 import Streamly.External.Network.HTTP.Wire (Request (..), RequestBody (..))
 
 -- | Whether the connection is in clear or over TLS.
@@ -63,43 +58,40 @@ data Url = Url
 -- fragment is dropped. A URL with a user name is refused, and so is one
 -- that holds a space or a control character.
 parseUrl :: ByteString -> Either String Url
-parseUrl bytes = case runIdentity (Stream.parse url (Stream.unfold StreamlyBS.reader bytes)) of
-  Left (Parser.ParseError problem) -> Left ("not an http or https URL: " <> problem)
-  Right found -> Right found
+parseUrl bytes = case FP.runParser url bytes of
+  FP.OK found _ -> Right found
+  FP.Fail -> Left "not an http or https URL"
+  FP.Err problem -> Left ("not an http or https URL: " <> problem)
 
--- | The parser behind 'parseUrl'.
-url :: Monad m => Parser Word8 m Url
+-- | The parser behind 'parseUrl'. It reads the input to its end.
+url :: FP.Parser String Url
 url = do
   scheme <- (Https <$ keyword "https://") <|> (Http <$ keyword "http://")
   host <- bracketed <|> named
-  port <- (Parser.satisfy (== colon) *> number) <|> pure (defaultPort scheme)
-  path <- Parser.takeWhile (\byte -> byte /= question && byte /= hash) Fold.toList
-  query <- Parser.takeWhile (/= hash) Fold.toList
-  void (Parser.takeWhile (const True) Fold.drain)
-  when (any (\byte -> byte <= 32 || byte == 127) (path <> query)) (Parser.die "a space or a control character")
-  case path of
-    first : _ | first /= slash -> Parser.die "something between the host and the path"
-    _ -> pure ()
-  pure Url {scheme, host, port, target = BS.pack ((if null path then [slash] else path) <> query)}
+  port <- (FP.word8 colon *> number) <|> pure (defaultPort scheme)
+  path <- FP.byteStringOf (FP.skipMany (satisfyByte (\byte -> byte /= question && byte /= hash)))
+  query <- FP.byteStringOf (FP.skipMany (satisfyByte (/= hash)))
+  void FP.takeRest
+  when (BS.any (\byte -> byte <= 32 || byte == 127) (path <> query)) (FP.err "a space or a control character")
+  unless (BS.null path || BS.head path == slash) (FP.err "something between the host and the path")
+  pure Url {scheme, host, port, target = (if BS.null path then BS.singleton slash else path) <> query}
   where
-    keyword text = void (Parser.listEqBy (\one other -> lowerByte one == lowerByte other) (BS.unpack text))
+    keyword = mapM_ (\expected -> satisfyByte ((== expected) . lowerByte)) . BS.unpack
     -- An IPv6 address between brackets.
     bracketed = do
-      void (Parser.satisfy (== 91))
-      address <- Parser.takeWhile1 (\byte -> isHexDigit byte || byte == colon || byte == 46) Fold.toList
-      void (Parser.satisfy (== 93))
-      pure (map toLower (BS8.unpack (BS.pack address)))
-    named = do
-      name <- Parser.takeWhile1 hostByte Fold.toList
-      pure (map toLower (BS8.unpack (BS.pack name)))
+      FP.word8 91
+      address <- FP.byteStringOf (FP.skipSome (satisfyByte (\byte -> isHexDigit byte || byte == colon || byte == 46)))
+      FP.word8 93
+      pure (map toLower (BS8.unpack address))
+    named = map toLower . BS8.unpack <$> FP.byteStringOf (FP.skipSome (satisfyByte hostByte))
     -- Letters, digits and what else a name or an IPv4 address may hold.
     -- An at sign, which would end a user name, is not among them.
     hostByte byte = isAlphaNum byte || BS.elem byte "-._~%!$&'()*+,;="
     number = do
-      digits <- Parser.takeWhile1 isDigit Fold.toList
-      let value = foldl' (\total digit -> total * 10 + fromIntegral (digit - 48)) 0 digits :: Int
-      when (length digits > 5 || value < 1 || value > 65535) (Parser.die "a port out of range")
-      pure value
+      digits <- FP.byteStringOf (FP.skipSome (satisfyByte isDigit))
+      let value = BS.foldl' (\total byte -> total * 10 + fromIntegral (byte - 48)) 0 digits :: Int
+      if BS.length digits > 5 || value < 1 || value > 65535 then FP.failed else pure value
+    satisfyByte accepted = FP.anyWord8 >>= \byte -> if accepted byte then pure () else FP.failed
 
 -- | Write a URL, the port left out when it is the one of the scheme.
 renderUrl :: Url -> ByteString
