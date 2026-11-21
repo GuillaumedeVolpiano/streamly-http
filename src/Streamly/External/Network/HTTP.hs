@@ -15,7 +15,8 @@
 -- >   response <- fetch (get "example.org" 80 "/")
 -- >   print (response.status, header "content-type" response)
 --
--- Each request opens a connection and closes it afterwards. TLS is not
+-- Each request opens a connection and closes it afterwards, unless it
+-- goes through a 'Session', which keeps its connection for the next. TLS is not
 -- built in: 'withResponseOver' takes a connection opened by other means,
 -- such as one of @streamly-network-tls@. No redirect is followed and no
 -- content coding is decoded. Each wait is limited (see 'Limits'), but
@@ -44,6 +45,13 @@ module Streamly.External.Network.HTTP
   , withResponseWithin
   , fetchWithin
 
+    -- * Several requests over one connection
+  , Session
+  , withSession
+  , withSessionOver
+  , withResponseIn
+  , fetchIn
+
     -- * Other transports
   , Transport (..)
   , socketTransport
@@ -57,7 +65,10 @@ module Streamly.External.Network.HTTP
   , HttpError (..)
   ) where
 
-import Control.Exception (IOException, bracketOnError, finally, mask, throwIO, try)
+import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar)
+import Control.Exception (IOException, SomeException, bracket, bracketOnError, finally, fromException, mask, onException, throwIO, try)
+import Control.Monad (void)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BS8
 import Data.Char (toLower)
@@ -189,6 +200,131 @@ withResponseOver limits transport request use = do
 -- | Like 'fetchWithin', over a connection that is already open.
 fetchOver :: Limits -> Transport -> Request -> IO (Response (Array Word8))
 fetchOver limits transport request = withResponseOver limits transport request collect
+
+-- | A server, and the connection to it that is kept from one request to
+-- the next.
+data Session = Session
+  { opener :: IO (Transport, IO ())
+  , limits :: Limits
+  , live :: MVar (Maybe Live)
+  -- ^ The connection kept, if any. Held during an exchange: the requests
+  -- of a session go one at a time.
+  }
+
+-- | An open connection of a session.
+data Live = Live
+  { transport :: Transport
+  , shut :: IO ()
+  , input :: StreamK.StreamK IO (Array Word8)
+  -- ^ What is still to read from the connection.
+  , received :: IORef Int
+  -- ^ How many bytes came from the connection so far.
+  }
+
+-- | Use a session with a host and a port, over plain TCP. Its requests
+-- reuse one connection when they can, instead of opening one each: see
+-- 'withResponseIn'. The connection kept is closed at the end.
+withSession :: Limits -> String -> Int -> (Session -> IO a) -> IO a
+withSession limits host port = withSessionOver limits $ do
+  socket <- connectWithin limits.connectTimeout host port
+  -- On a connection that is reused, a request held back until the last
+  -- response is acknowledged costs tens of milliseconds each time.
+  Net.setSocketOption socket Net.NoDelay 1
+  pure (socketTransport socket, Net.close socket)
+
+-- | Like 'withSession', with the way to open a connection to the server
+-- left to an action, which gives a transport and what closes it: for TLS,
+-- among others. The time to connect is up to that action; the other
+-- limits apply.
+withSessionOver :: Limits -> IO (Transport, IO ()) -> (Session -> IO a) -> IO a
+withSessionOver limits opener = bracket (Session opener limits <$> newMVar Nothing) finish
+  where
+    finish session = takeMVar session.live >>= mapM_ (quietly . (.shut))
+
+-- | Send a request in a session and use the response, as 'withResponse'
+-- does, over the connection of the session when there is one.
+--
+-- The connection is kept for the next request when the response allows
+-- it: its body was consumed to its end inside the function, its length
+-- was announced or it was chunked, and the server did not ask to close.
+-- Otherwise it is closed, and the next request opens another.
+--
+-- A server may close a connection it finds idle. When a request on a
+-- connection already used gets no answer at all, it is sent again once on
+-- a new connection, unless its body is a stream, which cannot be read
+-- twice. A server that had acted on the request before losing the
+-- connection then acts twice.
+--
+-- The host and the port of the request only serve its @Host@ header: the
+-- server is that of the session. Requests go one at a time; a second
+-- thread waits for the first.
+withResponseIn :: Session -> Request -> (Response (Stream IO (Array Word8)) -> IO a) -> IO a
+withResponseIn session request use = do
+  either throwIO pure (validateRequest request)
+  -- The connection in hand, to close if the exchange fails.
+  inHand <- newIORef Nothing
+  mask $ \restore -> do
+    current <- takeMVar session.live
+    writeIORef inHand current
+    (value, kept) <-
+      restore (exchange inHand current) `onException` do
+        readIORef inHand >>= mapM_ (quietly . (.shut))
+        putMVar session.live Nothing
+    putMVar session.live kept
+    pure value
+  where
+    persistent = withHeaders (filter (\(name, _) -> BS8.map toLower name /= "connection") request.headers) request
+    replayable = case request.body of
+      BodyStream _ -> False
+      _ -> True
+    open inHand = do
+      (transport, shut) <- session.opener
+      received <- newIORef 0
+      let limited = limitTransport session.limits.idleTimeout transport
+          counted = Stream.mapM (\array -> array <$ modifyIORef' received (+ Array.length array)) limited.receive
+          connection = Live {transport = limited, shut, input = StreamK.fromStream counted, received}
+      connection <$ writeIORef inHand (Just connection)
+    -- Send the request and read the head of the response.
+    start connection = do
+      Stream.fold (Fold.drainMapM connection.transport.send) (renderRequest persistent)
+      readResponseReusable session.limits.maxHeadSize session.limits.maxBodySize request.method connection.input
+    exchange inHand = \case
+      Nothing -> open inHand >>= \connection -> start connection >>= complete inHand connection
+      Just connection -> do
+        before <- readIORef connection.received
+        try (start connection) >>= \case
+          Right started -> complete inHand connection started
+          Left (problem :: SomeException) -> do
+            after <- readIORef connection.received
+            -- No answer at all on a connection already used: the server
+            -- had closed it.
+            if replayable && after == before && stale problem
+              then do
+                quietly connection.shut
+                writeIORef inHand Nothing
+                fresh <- open inHand
+                start fresh >>= complete inHand fresh
+              else throwIO problem
+    stale problem = case (fromException problem, fromException problem) of
+      (Just (_ :: IOException), _) -> True
+      (_, Just (MalformedResponse _)) -> True
+      _ -> False
+    complete inHand connection (response, following) = do
+      value <- use response
+      following >>= \case
+        Just rest -> pure (value, Just connection {input = rest})
+        Nothing -> do
+          writeIORef inHand Nothing
+          quietly connection.shut
+          pure (value, Nothing)
+
+-- | Send a request in a session and read the whole response into memory.
+-- See 'withResponseIn'.
+fetchIn :: Session -> Request -> IO (Response (Array Word8))
+fetchIn session request = withResponseIn session request collect
+
+quietly :: IO () -> IO ()
+quietly action = void (try @SomeException action)
 
 collect :: Response (Stream IO (Array Word8)) -> IO (Response (Array Word8))
 collect response = do

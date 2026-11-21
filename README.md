@@ -25,6 +25,23 @@ main = do
   print arrays
 ```
 
+## Several requests to one server
+
+```haskell
+import Streamly.External.Network.HTTP
+
+main :: IO ()
+main = withSession defaultLimits "example.org" 80 $ \session -> do
+  first <- fetchIn session (get "example.org" 80 "/a")
+  second <- fetchIn session (get "example.org" 80 "/b")
+  print (first.status, second.status)
+```
+
+The connection is kept when the body was read to its end, its length was
+announced or it was chunked, and the server did not ask to close. A
+connection that the server has closed while idle is replaced without a
+word: the request is sent again once, unless its body is a stream.
+
 ## Modules
 
 - `Streamly.External.Network.HTTP`: the client over TCP (`get`, `fetch`,
@@ -42,7 +59,9 @@ main = do
   opened by other means, as a `Transport`: one of
   [streamly-network-tls](https://github.com/GuillaumedeVolpiano/streamly-network-tls)
   gives HTTPS.
-- One connection per request (`Connection: close`).
+- One connection per request (`Connection: close`), unless the requests go
+  through a session: `withSession` keeps the connection to a server for
+  the next request when the response allows it.
 - Redirects are not followed and content codings are not decoded.
 - A request names its host, its port and its target. URLs are read by
   `Streamly.External.Network.HTTP.URL`; fetching by URL, with the scheme

@@ -22,6 +22,7 @@ module Streamly.External.Network.HTTP.Wire
   , header
   , readResponse
   , readResponseWithin
+  , readResponseReusable
   , readResponseHead
   , readResponseHeadWithin
 
@@ -41,12 +42,12 @@ module Streamly.External.Network.HTTP.Wire
   , chunkSizeLine
   ) where
 
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, throwIO, try)
 import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import Numeric (showHex)
 import Streamly.Data.Array (Array)
@@ -217,12 +218,40 @@ readResponse = readResponseWithin Nothing Nothing
 -- response announces too long a body, and from the stream otherwise.
 readResponseWithin :: Maybe Int -> Maybe Int -> ByteString -> StreamK IO (Array Word8) -> IO (Response (Stream IO (Array Word8)))
 readResponseWithin maxHead maxBody method input = do
-  (found, rest) <- readResponseHeadWithin maxHead input
+  ((_, found), rest) <- headWithin maxHead versionedHeadFrom input
   framing <- either throwIO pure (bodyFraming method found)
   case (framing, maxBody) of
     (Fixed announced, Just limit) | announced > limit -> throwIO (BodyTooLarge limit)
     _ -> pure ()
-  pure (maybe id limitBody maxBody (bodyStream framing rest) <$ found)
+  pure (maybe id limitBody maxBody (bodyStream Nothing framing rest) <$ found)
+
+-- | Like 'readResponseWithin', for a connection that may carry another
+-- exchange afterwards. The action given with the response tells, once the
+-- body has been consumed, whether the connection can go on, and gives the
+-- input that follows the response if it can. It cannot when the body was
+-- not read to its end, when only the end of the connection ends the body,
+-- when the server speaks HTTP\/1.0 without asking to keep the connection,
+-- or when it says @Connection: close@.
+--
+-- Unlike 'readResponseWithin', this reads the trailer fields of a chunked
+-- body, to find where the next response starts.
+readResponseReusable
+  :: Maybe Int
+  -> Maybe Int
+  -> ByteString
+  -> StreamK IO (Array Word8)
+  -> IO (Response (Stream IO (Array Word8)), IO (Maybe (StreamK IO (Array Word8))))
+readResponseReusable maxHead maxBody method input = do
+  ((minor, found), rest) <- headWithin maxHead versionedHeadFrom input
+  framing <- either throwIO pure (bodyFraming method found)
+  case (framing, maxBody) of
+    (Fixed announced, Just limit) | announced > limit -> throwIO (BodyTooLarge limit)
+    _ -> pure ()
+  after <- newIORef Nothing
+  let wishes = maybe [] (map (lowerAscii . BS8.strip) . BS.split 44) (header "connection" found)
+      persistent = "close" `notElem` wishes && (minor >= 1 || "keep-alive" `elem` wishes)
+      following = if persistent then readIORef after else pure Nothing
+  pure (maybe id limitBody maxBody (bodyStream (Just after) framing rest) <$ found, following)
 
 -- | Read the head of a response, and give what follows it in the input:
 -- the body, or after a status 101 the bytes of the protocol switched to.
@@ -302,10 +331,17 @@ readRequestHeadWithin limit = headWithin limit $ \input -> do
 
 headFrom :: StreamK IO (Array Word8) -> IO (Response (), StreamK IO (Array Word8))
 headFrom input = do
-  (found, rest) <- parseOrThrow responseHead input
+  ((_, found), rest) <- versionedHeadFrom input
+  pure (found, rest)
+
+-- | The head of a response with the minor version of its protocol: 0 for
+-- HTTP\/1.0, 1 for HTTP\/1.1.
+versionedHeadFrom :: StreamK IO (Array Word8) -> IO ((Int, Response ()), StreamK IO (Array Word8))
+versionedHeadFrom input = do
+  (versioned@(_, found), rest) <- parseOrThrow versionedHead input
   if found.status >= 100 && found.status < 200 && found.status /= 101
-    then headFrom rest
-    else pure (found, rest)
+    then versionedHeadFrom rest
+    else pure (versioned, rest)
 
 -- | Stop a body that grows beyond a number of bytes.
 limitBody :: Int -> Stream IO (Array Word8) -> Stream IO (Array Word8)
@@ -347,21 +383,36 @@ data BodyState
     -- this is a chunk (then a line end and another chunk follow).
     InData Int (StreamK IO (Array Word8)) Bool
 
-bodyStream :: Framing -> StreamK IO (Array Word8) -> Stream IO (Array Word8)
-bodyStream framing input = case framing of
-  Empty -> Stream.nil
+-- | The body, read from the input as the stream is consumed. With a
+-- place to leave it, the input that follows the body is left there once
+-- the body has been read to its end, when the body says where it ends.
+bodyStream :: Maybe (IORef (Maybe (StreamK IO (Array Word8)))) -> Framing -> StreamK IO (Array Word8) -> Stream IO (Array Word8)
+bodyStream after framing input = case framing of
+  Empty -> Stream.concatEffect (Stream.nil <$ leave input)
   UntilClose -> StreamK.toStream input
   Fixed n -> Stream.unfoldrM step (InData n input False)
   Chunked -> Stream.unfoldrM step (AtChunkSize input)
   where
+    leave rest = mapM_ (\place -> writeIORef place (Just rest)) after
     step (AtChunkSize from) = do
       (size, rest) <- parseOrThrow chunkSizeLine from
-      if size == 0 then pure Nothing else step (InData size rest True)
+      if size /= 0
+        then step (InData size rest True)
+        else do
+          -- The trailer fields are only read to find what follows them;
+          -- a trailer that cannot be read ends the use of the connection,
+          -- not the body.
+          case after of
+            Nothing -> pure ()
+            Just _ -> do
+              trailer <- try (parseOrThrow (Parser.many headerLine Fold.drain *> lineEnd) rest)
+              either (\(_ :: HttpError) -> pure ()) (leave . snd) trailer
+          pure Nothing
     step (InData 0 from chunked)
       | chunked = do
           ((), rest) <- parseOrThrow lineEnd from
           step (AtChunkSize rest)
-      | otherwise = pure Nothing
+      | otherwise = Nothing <$ leave from
     step (InData remaining from chunked) = do
       next <- StreamK.uncons from
       case next of
@@ -388,16 +439,20 @@ parseOrThrow parser input = do
 -- spaces around them. Lines end with a line feed, after an optional
 -- carriage return. Header lines folded over several lines are refused.
 responseHead :: Monad m => Parser Word8 m (Response ())
-responseHead = do
+responseHead = snd <$> versionedHead
+
+-- | 'responseHead', with the minor version of the protocol of the server.
+versionedHead :: Monad m => Parser Word8 m (Int, Response ())
+versionedHead = do
   void (Parser.listEq (BS.unpack "HTTP/1."))
-  void (Parser.satisfy isDigit)
+  minor <- Parser.satisfy isDigit
   void (Parser.satisfy (== space))
   digits <- Parser.takeWhile1 isDigit Fold.toList
   when (length digits /= 3) (Parser.die "the status code does not have three digits")
   reason <- restOfLine
   found <- Parser.many headerLine Fold.toList
   lineEnd
-  pure Response {status = foldl' (\total digit -> total * 10 + fromIntegral (digit - 48)) 0 digits, reason, headers = found, body = ()}
+  pure (fromIntegral (minor - 48), Response {status = foldl' (\total digit -> total * 10 + fromIntegral (digit - 48)) 0 digits, reason, headers = found, body = ()})
 
 -- | The request line, the header lines and the empty line that ends them,
 -- read as 'responseHead' reads those of a response.

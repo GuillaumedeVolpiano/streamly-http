@@ -4,7 +4,7 @@ module Main (main) where
 
 import Control.Concurrent.Async (wait, withAsync)
 import Control.Concurrent (threadDelay)
-import Control.Exception (bracket, try)
+import Control.Exception (SomeException, bracket, try)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
@@ -38,6 +38,7 @@ tests =
       , testGroup "writing a request" writing
       , testGroup "URLs" urls
       , testGroup "over TCP" overTcp
+      , testGroup "sessions" sessions
       ]
 
 -- | Read a response to a GET from the bytes, cut into pieces of a size.
@@ -471,3 +472,129 @@ overTcp =
     closedPort = bracket (Net.socket Net.AF_INET Net.Stream Net.defaultProtocol) Net.close $ \socket -> do
       Net.bind socket (Net.SockAddrInet 0 (Net.tupleToHostAddress (127, 0, 0, 1)))
       fromIntegral <$> Net.socketPort socket
+
+-- | Run a server that takes connections one after the other and, on each,
+-- answers request after request with a function of the number of the
+-- connection, the number of the request on it and its target. An answer
+-- of 'Nothing' closes the connection without a word; 'True' with the
+-- bytes closes it after them. Gives the port, and returns the result with
+-- the requests seen: connection, request, target.
+withKeepingServer :: (Int -> Int -> ByteString -> Maybe (ByteString, Bool)) -> (Int -> IO a) -> IO (a, [(Int, Int, ByteString)])
+withKeepingServer answer action = do
+  seen <- newIORef []
+  bracket open Net.close $ \listener -> do
+    port <- Net.socketPort listener
+    result <- withAsync (mapM_ (connection seen listener) [1 ..]) $ \_ -> action (fromIntegral port)
+    (result,) . reverse <$> readIORef seen
+  where
+    open = do
+      listener <- Net.socket Net.AF_INET Net.Stream Net.defaultProtocol
+      Net.setSocketOption listener Net.ReuseAddr 1
+      Net.bind listener (Net.SockAddrInet 0 (Net.tupleToHostAddress (127, 0, 0, 1)))
+      Net.listen listener 5
+      pure listener
+    connection seen listener number =
+      bracket (fst <$> Net.accept listener) Net.close $ \peer -> requests seen peer number (1 :: Int) ""
+    requests seen peer number index buffered = do
+      (requestHead', rest) <- readHead peer buffered
+      if BS.null requestHead'
+        then pure ()
+        else do
+          let target = BS8.takeWhile (/= ' ') (BS.drop 1 (BS8.dropWhile (/= ' ') requestHead'))
+          modifyIORef seen ((number, index, target) :)
+          case answer number index target of
+            Nothing -> pure ()
+            Just (bytes, closing) -> do
+              NetBS.sendAll peer bytes
+              if closing then pure () else requests seen peer number (index + 1) rest
+    -- A request head, and what came after it; an empty head at the end of
+    -- the connection.
+    readHead peer buffered = case BS.breakSubstring "\r\n\r\n" buffered of
+      (found, rest) | not (BS.null rest) -> pure (found, BS.drop 4 rest)
+      _ -> do
+        more <- NetBS.recv peer 4096
+        if BS.null more then pure ("", "") else readHead peer (buffered <> more)
+
+lengthAnswer :: ByteString -> ByteString
+lengthAnswer content = "HTTP/1.1 200 OK\r\nContent-Length: " <> BS8.pack (show (BS.length content)) <> "\r\n\r\n" <> content
+
+-- | The targets asked, with the connection and the request each went on.
+bodies :: [Response (Array Word8)] -> [ByteString]
+bodies = map (\response -> StreamlyBS.fromArray response.body)
+
+sessions :: [TestTree]
+sessions =
+  [ testCase "requests share one connection, whether the bodies are announced or chunked" $ do
+      let answer _ _ = \case
+            "/chunked" -> Just ("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\nTrailer: x\r\n\r\n", False)
+            "/empty" -> Just ("HTTP/1.1 204 No Content\r\n\r\n", False)
+            target -> Just (lengthAnswer ("at " <> target), False)
+      (responses, seen) <- withKeepingServer answer $ \port ->
+        withSession defaultLimits "127.0.0.1" port $ \session ->
+          mapM (\target -> fetchIn session (get "127.0.0.1" port target)) ["/a", "/chunked", "/empty", "/b"]
+      bodies responses @?= ["at /a", "abcde", "", "at /b"]
+      seen @?= [(1, 1, "/a"), (1, 2, "/chunked"), (1, 3, "/empty"), (1, 4, "/b")]
+  , testCase "the request does not ask to close, and a Connection header of the caller is left out" $ do
+      requestSeen <- newIORef ""
+      let transport = Transport {send = \array -> modifyIORef requestSeen (<> StreamlyBS.fromArray array), receive = Stream.fromList [StreamlyBS.toArray (lengthAnswer "ok")]}
+      response <- withSessionOver defaultLimits (pure (transport, pure ())) $ \session ->
+        fetchIn session (withHeaders [("Connection", "close"), ("Accept", "*/*")] (get "example.org" 80 "/"))
+      StreamlyBS.fromArray response.body @?= "ok"
+      readIORef requestSeen >>= (@?= "GET / HTTP/1.1\r\nHost: example.org\r\nAccept: */*\r\n\r\n")
+  , testCase "a server that asks to close, or speaks HTTP/1.0, gets a new connection for the next request" $ do
+      let answer _ _ = \case
+            "/close" -> Just ("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok", True)
+            "/old" -> Just ("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok", True)
+            "/old-kept" -> Just ("HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: 2\r\n\r\nok", False)
+            "/until-end" -> Just ("HTTP/1.1 200 OK\r\n\r\nok", True)
+            _ -> Just (lengthAnswer "ok", False)
+      (responses, seen) <- withKeepingServer answer $ \port ->
+        withSession defaultLimits "127.0.0.1" port $ \session ->
+          mapM (\target -> fetchIn session (get "127.0.0.1" port target)) ["/close", "/old", "/old-kept", "/kept", "/until-end", "/last"]
+      bodies responses @?= replicate 6 "ok"
+      map (\(connection, request, _) -> (connection, request)) seen @?= [(1, 1), (2, 1), (3, 1), (3, 2), (3, 3), (4, 1)]
+  , testCase "a body that is not read to its end costs the connection" $ do
+      (firstBytes, seen) <- withKeepingServer (\_ _ target -> Just (lengthAnswer ("0123456789 " <> target), False)) $ \port ->
+        withSession defaultLimits "127.0.0.1" port $ \session -> do
+          firstBytes <- withResponseIn session (get "127.0.0.1" port "/a") (\response -> Stream.toList (Stream.take 0 response.body) >> pure response.status)
+          second <- fetchIn session (get "127.0.0.1" port "/b")
+          pure (firstBytes, StreamlyBS.fromArray second.body)
+      firstBytes @?= (200, "0123456789 /b")
+      map (\(connection, request, _) -> (connection, request)) seen @?= [(1, 1), (2, 1)]
+  , testCase "a connection the server has closed while idle is replaced without a word" $ do
+      -- The server closes after each answer, without saying so.
+      (responses, seen) <- withKeepingServer (\_ _ target -> Just (lengthAnswer ("at " <> target), True)) $ \port ->
+        withSession defaultLimits "127.0.0.1" port $ \session ->
+          mapM (\target -> fetchIn session (get "127.0.0.1" port target) <* threadDelay 50_000) ["/a", "/b", "/c"]
+      bodies responses @?= ["at /a", "at /b", "at /c"]
+      map (\(connection, _, target) -> (connection, target)) seen @?= [(1, "/a"), (2, "/b"), (3, "/c")]
+  , testCase "a request with a body that is a stream is not sent twice" $ do
+      (outcome, _) <- withKeepingServer (\_ _ _ -> Just (lengthAnswer "ok", True)) $ \port ->
+        withSession defaultLimits "127.0.0.1" port $ \session -> do
+          _ <- fetchIn session (get "127.0.0.1" port "/first")
+          threadDelay 50_000
+          let streamed = withBody (BodyStream (Stream.fromList [StreamlyBS.toArray "once"])) (get "127.0.0.1" port "/second") {method = "POST"}
+          lost <- try @SomeException (fetchIn session streamed)
+          after <- fetchIn session (get "127.0.0.1" port "/third")
+          pure (either (const True) (const False) lost, StreamlyBS.fromArray after.body)
+      outcome @?= (True, "ok")
+  , testCase "a failure inside an exchange leaves the session usable" $ do
+      let answer _ _ = \case
+            "/cut" -> Just ("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", True)
+            target -> Just (lengthAnswer ("at " <> target), False)
+      (outcome, seen) <- withKeepingServer answer $ \port ->
+        withSession defaultLimits "127.0.0.1" port $ \session -> do
+          cut <- try (fetchIn session (get "127.0.0.1" port "/cut"))
+          thrown <- try @IOError (withResponseIn session (get "127.0.0.1" port "/a") (\_ -> ioError (userError "inside")))
+          after <- fetchIn session (get "127.0.0.1" port "/b")
+          pure (fmap (.status) cut, either (const True) (const False) thrown, StreamlyBS.fromArray after.body)
+      outcome @?= (Left (TruncatedBody 7), True, "at /b")
+      map (\(connection, _, target) -> (connection, target)) seen @?= [(1, "/cut"), (2, "/a"), (3, "/b")]
+  , testCase "the limits of the session apply to each exchange" $ do
+      (outcome, _) <- withKeepingServer (\_ _ target -> Just (lengthAnswer target, False)) $ \port ->
+        withSession defaultLimits {maxBodySize = Just 5} "127.0.0.1" port $ \session -> do
+          small <- fetchIn session (get "127.0.0.1" port "/ok")
+          large <- try (fetchIn session (get "127.0.0.1" port "/too-long"))
+          pure (StreamlyBS.fromArray small.body, fmap (.status) large)
+      outcome @?= ("/ok", Left (BodyTooLarge 5))
+  ]

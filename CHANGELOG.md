@@ -11,6 +11,10 @@
   by default). `readResponseWithin` and `readResponseHeadWithin` take them
   at the level of the message format.
 * `withResponseOver` and `fetchOver` take the `Limits`.
+* Sessions: `withSession` keeps the connection to a server from one
+  request to the next (`withResponseIn`, `fetchIn`), and opens another
+  when the server has closed it; `withSessionOver` for other transports.
+  `readResponseReusable` tells where a response ends on its connection.
 * The head of a request, as a server reads it: `RequestHead`,
   `readRequestHeadWithin`. `HttpError` gains `MalformedRequest`.
 * `HttpError` gains `ConnectTimedOut`, `ResponseTimedOut`, `HeadTooLarge`
