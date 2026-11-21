@@ -1,6 +1,6 @@
 # Revision history for streamly-http
 
-## 0.1.0.0 -- unreleased
+## 0.1.0.0 -- 2026-11-21
 
 * An HTTP/1.1 client over TCP: `get`, `fetch`, `withResponse`.
 * The message format on streams of byte arrays: `renderRequest`,
