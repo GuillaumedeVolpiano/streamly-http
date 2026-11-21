@@ -1,6 +1,6 @@
 # Revision history for streamly-http
 
-## 0.2.0.0 -- unreleased
+## 0.2.0.0 -- 2026-11-21
 
 * Time limits: `Limits`, with thirty seconds to connect and thirty seconds
   of silence by default, in `withResponse` and `fetch`; `withResponseWithin`
