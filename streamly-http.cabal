@@ -25,12 +25,20 @@ source-repository head
   location: https://github.com/GuillaumedeVolpiano/streamly-http.git
 
 common shared
-  default-language:   GHC2024
+  default-language:   GHC2021
   default-extensions:
+    DataKinds
+    DerivingStrategies
+    DisambiguateRecordFields
     DuplicateRecordFields
+    ExplicitNamespaces
+    GADTs
+    LambdaCase
+    MonoLocalBinds
     NoFieldSelectors
     OverloadedRecordDot
     OverloadedStrings
+    RoleAnnotations
 
   ghc-options:
     -Wall -Wcompat -Wredundant-constraints -Wmissing-deriving-strategies
@@ -45,9 +53,9 @@ library
     Streamly.External.Network.HTTP.Wire
 
   build-depends:
-    , base                 ^>=4.21
+    , base                 >=4.19 && <4.22
     , bytestring           ^>=0.12
-    , containers           ^>=0.7
+    , containers           >=0.6.7 && <0.8
     , flatparse            ^>=0.5
     , network              ^>=3.2
     , streamly-bytestring  ^>=0.2.3
@@ -63,7 +71,7 @@ test-suite streamly-http-test
   ghc-options:    -threaded
   build-depends:
     , async                ^>=2.2
-    , base                 ^>=4.21
+    , base                 >=4.19 && <4.22
     , bytestring           ^>=0.12
     , network              ^>=3.2
     , streamly-bytestring  ^>=0.2.3
