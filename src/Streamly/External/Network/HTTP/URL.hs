@@ -27,6 +27,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BS8
 import Data.Char (toLower)
+import Data.List qualified as List
 import Data.Word (Word8)
 import FlatParse.Basic qualified as FP
 import Streamly.External.Network.HTTP.Wire (Request (..), RequestBody (..))
@@ -137,7 +138,7 @@ removeDots path = "/" <> BS.intercalate "/" (reverse kept) <> (if trailing then 
     trailing = case reverse segments of
       final : _ -> final `elem` ["", ".", ".."] && path /= "/"
       [] -> False
-    kept = foldl' step [] segments
+    kept = List.foldl' step [] segments
     step done segment
       | segment == "." || segment == "" = done
       | segment == ".." = drop 1 done
