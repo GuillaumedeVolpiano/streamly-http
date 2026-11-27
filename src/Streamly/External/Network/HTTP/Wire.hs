@@ -272,7 +272,7 @@ readResponseHeadWithin limit input = do
 
 -- | The head of a request, as a server receives it: the method, the
 -- target, and the headers with their names in lower case. (Without field
--- names, which would make updates of a 'Request' ambiguous.)
+-- names, which would make updates of a t'Request' ambiguous.)
 data RequestHead = RequestHead ByteString ByteString [Header]
   deriving stock (Eq, Show)
 

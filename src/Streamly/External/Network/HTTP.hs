@@ -16,10 +16,10 @@
 -- >   print (response.status, header "content-type" response)
 --
 -- Each request opens a connection and closes it afterwards, unless it
--- goes through a 'Session', which keeps its connection for the next. TLS is not
+-- goes through a t'Session', which keeps its connection for the next. TLS is not
 -- built in: 'withResponseOver' takes a connection opened by other means,
 -- such as one of @streamly-network-tls@. No redirect is followed and no
--- content coding is decoded. Each wait is limited (see 'Limits'), but
+-- content coding is decoded. Each wait is limited (see t'Limits'), but
 -- neither the whole time taken nor the size of a response: wrap the calls
 -- in 'System.Timeout.timeout' and count the bytes of the stream as needed.
 -- A status is never an error: look at 'status'.
@@ -98,8 +98,8 @@ import Streamly.External.Network.HTTP.Wire
 import System.Timeout (timeout)
 
 -- | A @GET@ request for a target on a host and a port, without headers.
--- 'withHeaders' and 'withBody' change the fields that 'Request' shares
--- with 'Response'.
+-- 'withHeaders' and 'withBody' change the fields that t'Request' shares
+-- with t'Response'.
 get :: String -> Int -> ByteString -> Request
 get host port target = Request {method = "GET", host, port, target, headers = [], body = NoBody}
 
