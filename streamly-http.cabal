@@ -71,11 +71,11 @@ test-suite streamly-http-test
   ghc-options:    -threaded
   build-depends:
     , async                ^>=2.2
-    , base                 >=4.19 && <4.22
-    , bytestring           ^>=0.12
-    , network              ^>=3.2
-    , streamly-bytestring  ^>=0.2.3
-    , streamly-core        ^>=0.3.3
+    , base
+    , bytestring
+    , network
+    , streamly-bytestring
+    , streamly-core
     , streamly-http
     , tasty                ^>=1.5
     , tasty-hunit          ^>=0.10
