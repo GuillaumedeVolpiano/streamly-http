@@ -45,22 +45,28 @@ module Streamly.External.Network.HTTP.Wire
 import Control.Applicative ((<|>))
 import Control.Exception (Exception, throwIO, try)
 import Control.Monad (unless, void, when)
-import Data.ByteString (ByteString)
-import Data.ByteString qualified as BS
-import Data.ByteString.Char8 qualified as BS8
+import Data.ByteString (ByteString, dropWhileEnd, isPrefixOf, split)
+import Data.ByteString qualified as BS (all, concat, dropWhile, elem, foldl',
+                                        length, map, null)
+import Data.ByteString.Char8 (pack, readInt, strip)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word8)
-import FlatParse.Basic qualified as FP
+import FlatParse.Basic (Parser, anyWord8, byteString, byteStringOf, cut, err,
+                        failed, fails, isolate, lookahead, many, skipMany,
+                        skipSome, takeRest, withByteString, word8)
 import Numeric (showHex)
-import Streamly.Data.Array (Array)
-import Streamly.Data.Array qualified as Array
-import Streamly.Data.Stream (Stream)
-import Streamly.Data.Stream qualified as Stream
-import Streamly.Data.StreamK (StreamK)
-import Streamly.Data.StreamK qualified as StreamK
-import Streamly.External.ByteString qualified as StreamlyBS
-import Streamly.External.FlatParse qualified as Flat
+import Streamly.Data.Array (Array, createOf)
+import Streamly.Data.Array qualified as A (length, read)
+import Streamly.Data.Stream (Stream, append, concatEffect, fold, fromList,
+                             fromPure, nil, unfoldrM)
+import Streamly.Data.Stream qualified as S (concatMap, cons, drop, filter, mapM,
+                                            take)
+import Streamly.Data.StreamK (StreamK, toStream, uncons)
+import Streamly.Data.StreamK qualified as K (cons)
+import Streamly.External.ByteString (toArray)
+import Streamly.External.FlatParse (ParseError (Mismatch, ParserError, TooLong),
+                                    parseBreak)
 
 -- | A header name and its value.
 type Header = (ByteString, ByteString)
@@ -151,7 +157,7 @@ instance Exception HttpError
 validateRequest :: Request -> Either HttpError ()
 validateRequest request = do
   check (not (BS.null request.method) && BS.all isTokenByte request.method) "the method is not a token"
-  check ("/" `BS.isPrefixOf` request.target || request.target == "*") "the target does not start with a slash"
+  check ("/" `isPrefixOf` request.target || request.target == "*") "the target does not start with a slash"
   check (BS.all (\byte -> byte > space && byte /= 127) request.target) "the target holds a space or a control character"
   check (not (null request.host) && all hostChar request.host) "the host is empty or holds a space or a control character"
   check (request.port > 0 && request.port < 65536) "the port is out of range"
@@ -167,17 +173,17 @@ validateRequest request = do
 -- The request is not checked: see 'validateRequest'.
 renderRequest :: Request -> Stream IO (Array Word8)
 renderRequest request = case request.body of
-  NoBody -> Stream.fromPure (headWith [])
+  NoBody -> fromPure (headWith [])
   BodyBytes bytes ->
-    Stream.fromList
-      (headWith [("Content-Length", BS8.pack (show (BS.length bytes)))] : [StreamlyBS.toArray bytes | not (BS.null bytes)])
+    fromList
+      (headWith [("Content-Length", pack (show (BS.length bytes)))] : [toArray bytes | not (BS.null bytes)])
   BodyStream chunks ->
-    Stream.cons (headWith [("Transfer-Encoding", "chunked")]) $
-      Stream.concatMap chunk (Stream.filter ((> 0) . Array.length) chunks)
-        `Stream.append` Stream.fromPure (StreamlyBS.toArray "0\r\n\r\n")
+    S.cons (headWith [("Transfer-Encoding", "chunked")]) $
+      S.concatMap chunk (S.filter ((> 0) . A.length) chunks)
+        `append` fromPure (toArray "0\r\n\r\n")
   where
     headWith framing =
-      StreamlyBS.toArray . BS.concat $
+      toArray . BS.concat $
         [request.method, " ", request.target, " HTTP/1.1\r\n"]
           <> concatMap written (hostHeader <> kept <> framing)
           <> ["\r\n"]
@@ -188,13 +194,13 @@ renderRequest request = case request.body of
       | any (\(name, _) -> lowerAscii name == "host") request.headers = []
       | otherwise = [("Host", authority)]
     authority =
-      (if ':' `elem` request.host then "[" <> BS8.pack request.host <> "]" else BS8.pack request.host)
-        <> (if request.port == 80 then "" else ":" <> BS8.pack (show request.port))
+      (if ':' `elem` request.host then "[" <> pack request.host <> "]" else pack request.host)
+        <> (if request.port == 80 then "" else ":" <> pack (show request.port))
     chunk array =
-      Stream.fromList
-        [ StreamlyBS.toArray (BS8.pack (showHex (Array.length array) "\r\n"))
+      fromList
+        [ toArray (pack (showHex (A.length array) "\r\n"))
         , array
-        , StreamlyBS.toArray "\r\n"
+        , toArray "\r\n"
         ]
 
 -- | Read a response from the bytes received, given the method of the
@@ -249,7 +255,7 @@ readResponseReusable maxHead maxBody method input = do
     (Fixed announced, Just limit) | announced > limit -> throwIO (BodyTooLarge limit)
     _ -> pure ()
   after <- newIORef Nothing
-  let wishes = maybe [] (map (lowerAscii . BS8.strip) . BS.split 44) (header "connection" found)
+  let wishes = maybe [] (map (lowerAscii . strip) . split 44) (header "connection" found)
       persistent = "close" `notElem` wishes && (minor >= 1 || "keep-alive" `elem` wishes)
       following = if persistent then readIORef after else pure Nothing
   pure (maybe id limitBody maxBody (bodyStream (Just after) framing rest) <$ found, following)
@@ -311,28 +317,28 @@ versionedHeadWithin limit = go allowed
       if found.status >= 100 && found.status < 200 && found.status /= 101
         then go (budget - size) rest
         else pure (versioned, rest)
-    sized parser = FP.withByteString parser (\found bytes -> pure (BS.length bytes, found))
+    sized parser = withByteString parser (\found bytes -> pure (BS.length bytes, found))
 
 -- | Run a parser on the start of the input, which it may read no further
 -- than a number of bytes, and give what follows. Throws the error made of
 -- the reason when the input does not parse, and the other error when it
 -- would need more bytes than allowed.
-parsed :: (String -> HttpError) -> HttpError -> Int -> FP.Parser String a -> StreamK IO (Array Word8) -> IO (a, StreamK IO (Array Word8))
+parsed :: (String -> HttpError) -> HttpError -> Int -> Parser String a -> StreamK IO (Array Word8) -> IO (a, StreamK IO (Array Word8))
 parsed malformed tooLong limit parser input =
-  Flat.parseBreak limit parser input >>= \case
+  parseBreak limit parser input >>= \case
     (Right found, rest) -> pure (found, rest)
-    (Left Flat.Mismatch, _) -> throwIO (malformed "the input ended too early")
-    (Left (Flat.ParserError problem), _) -> throwIO (malformed problem)
-    (Left (Flat.TooLong _), _) -> throwIO tooLong
+    (Left Mismatch, _) -> throwIO (malformed "the input ended too early")
+    (Left (ParserError problem), _) -> throwIO (malformed problem)
+    (Left (TooLong _), _) -> throwIO tooLong
 
 -- | Stop a body that grows beyond a number of bytes.
 limitBody :: Int -> Stream IO (Array Word8) -> Stream IO (Array Word8)
-limitBody limit body = Stream.concatEffect $ do
+limitBody limit body = concatEffect $ do
   total <- newIORef 0
   pure $
-    Stream.mapM
+    S.mapM
       ( \array -> do
-          size <- (+ Array.length array) <$> readIORef total
+          size <- (+ A.length array) <$> readIORef total
           when (size > limit) (throwIO (BodyTooLarge limit))
           array <$ writeIORef total size
       )
@@ -349,11 +355,11 @@ bodyFraming :: ByteString -> Response () -> Either HttpError Framing
 bodyFraming method response
   | method == "HEAD" || response.status < 200 || response.status == 204 || response.status == 304 = Right Empty
   | Just coding <- header "transfer-encoding" response =
-      if lowerAscii (BS8.strip coding) == "chunked"
+      if lowerAscii (strip coding) == "chunked"
         then Right Chunked
         else Left (UnsupportedTransferEncoding coding)
   | Just raw <- header "content-length" response =
-      case BS8.readInt raw of
+      case readInt raw of
         Just (n, "") | BS.all isDigit raw -> Right (Fixed n)
         _ -> Left (InvalidContentLength raw)
   | otherwise = Right UntilClose
@@ -370,10 +376,10 @@ data BodyState
 -- the body has been read to its end, when the body says where it ends.
 bodyStream :: Maybe (IORef (Maybe (StreamK IO (Array Word8)))) -> Framing -> StreamK IO (Array Word8) -> Stream IO (Array Word8)
 bodyStream after framing input = case framing of
-  Empty -> Stream.concatEffect (Stream.nil <$ leave input)
-  UntilClose -> StreamK.toStream input
-  Fixed n -> Stream.unfoldrM step (InData n input False)
-  Chunked -> Stream.unfoldrM step (AtChunkSize input)
+  Empty -> concatEffect (nil <$ leave input)
+  UntilClose -> toStream input
+  Fixed n -> unfoldrM step (InData n input False)
+  Chunked -> unfoldrM step (AtChunkSize input)
   where
     leave rest = mapM_ (\place -> writeIORef place (Just rest)) after
     -- The lines between the chunks are short.
@@ -389,7 +395,7 @@ bodyStream after framing input = case framing of
           case after of
             Nothing -> pure ()
             Just _ -> do
-              trailer <- try (parsed MalformedResponse (MalformedResponse "a trailer that is too long") 65536 (FP.skipMany headerLine *> lineEnd) rest)
+              trailer <- try (parsed MalformedResponse (MalformedResponse "a trailer that is too long") 65536 (skipMany headerLine *> lineEnd) rest)
               either (\(_ :: HttpError) -> pure ()) (leave . snd) trailer
           pure Nothing
     step (InData 0 from chunked)
@@ -398,18 +404,18 @@ bodyStream after framing input = case framing of
           step (AtChunkSize rest)
       | otherwise = Nothing <$ leave from
     step (InData remaining from chunked) = do
-      next <- StreamK.uncons from
+      next <- uncons from
       case next of
         Nothing -> throwIO (TruncatedBody remaining)
         Just (array, rest)
           | size == 0 -> step (InData remaining rest chunked)
           | size <= remaining -> pure (Just (array, InData (remaining - size) rest chunked))
           | otherwise -> do
-              front <- Stream.fold (Array.createOf remaining) (Stream.take remaining (Array.read array))
-              back <- Stream.fold (Array.createOf (size - remaining)) (Stream.drop remaining (Array.read array))
-              pure (Just (front, InData 0 (StreamK.cons back rest) chunked))
+              front <- fold (createOf remaining) (S.take remaining (A.read array))
+              back <- fold (createOf (size - remaining)) (S.drop remaining (A.read array))
+              pure (Just (front, InData 0 (K.cons back rest) chunked))
           where
-            size = Array.length array
+            size = A.length array
 
 -- | The status line, the header lines and the empty line that ends them.
 -- The names of the headers are given in lower case, the values without the
@@ -419,61 +425,61 @@ bodyStream after framing input = case framing of
 -- Like the other parsers here, it fails while a line is not all there, so
 -- that it can be run with @parseBreak@ of @streamly-flatparse@ as the
 -- bytes come, and it stops on an error as soon as a whole line is wrong.
-responseHead :: FP.Parser String (Response ())
+responseHead :: Parser String (Response ())
 responseHead = snd <$> versionedHead
 
 -- | 'responseHead', with the minor version of the protocol of the server.
-versionedHead :: FP.Parser String (Int, Response ())
+versionedHead :: Parser String (Int, Response ())
 versionedHead = do
   (minor, status, reason) <- line "the first line is not the status line of HTTP/1" $ do
-    FP.byteString "HTTP/1."
+    byteString "HTTP/1."
     minor <- digit
-    FP.word8 space
-    digits <- FP.byteStringOf (FP.skipSome (satisfyByte isDigit))
-    when (BS.length digits /= 3) FP.failed
-    reason <- trimmed <$> FP.takeRest
+    word8 space
+    digits <- byteStringOf (skipSome (satisfyByte isDigit))
+    when (BS.length digits /= 3) failed
+    reason <- trimmed <$> takeRest
     pure (minor, BS.foldl' (\total byte -> total * 10 + fromIntegral (byte - 48)) 0 digits, reason)
-  found <- FP.many headerLine
+  found <- many headerLine
   lineEnd
   pure (minor, Response {status, reason, headers = found, body = ()})
 
 -- | The request line, the header lines and the empty line that ends them,
 -- read as 'responseHead' reads those of a response.
-requestHead :: FP.Parser String RequestHead
+requestHead :: Parser String RequestHead
 requestHead = do
   (method, target) <- line "the first line is not the request line of HTTP/1" $ do
-    method <- FP.byteStringOf (FP.skipSome (satisfyByte isTokenByte))
-    FP.word8 space
-    target <- FP.byteStringOf (FP.skipSome (satisfyByte (\byte -> byte > space && byte /= 127)))
-    FP.word8 space
-    FP.byteString "HTTP/1."
+    method <- byteStringOf (skipSome (satisfyByte isTokenByte))
+    word8 space
+    target <- byteStringOf (skipSome (satisfyByte (\byte -> byte > space && byte /= 127)))
+    word8 space
+    byteString "HTTP/1."
     void digit
-    FP.skipMany (FP.word8 carriageReturn)
+    skipMany (word8 carriageReturn)
     pure (method, target)
-  found <- FP.many headerLine
+  found <- many headerLine
   lineEnd
   pure (RequestHead method target found)
 
 -- | A header line: its name in lower case, and its value without the
 -- spaces around it. Fails, without an error, on the empty line that ends
 -- the headers.
-headerLine :: FP.Parser String Header
+headerLine :: Parser String Header
 headerLine = do
-  FP.fails lineEnd
+  fails lineEnd
   line "a header line is not a name, a colon and a value" $ do
-    name <- FP.byteStringOf (FP.skipSome (satisfyByte isTokenByte))
-    FP.word8 colon
-    value <- trimmed <$> FP.takeRest
+    name <- byteStringOf (skipSome (satisfyByte isTokenByte))
+    word8 colon
+    value <- trimmed <$> takeRest
     pure (lowerAscii name, value)
 
 -- | The line that starts a chunk: its size in hexadecimal, then extensions
 -- that are ignored.
-chunkSizeLine :: FP.Parser String Int
+chunkSizeLine :: Parser String Int
 chunkSizeLine = line "a chunk does not start with its size in hexadecimal" $ do
-  digits <- FP.byteStringOf (FP.skipSome (satisfyByte isHexDigit))
+  digits <- byteStringOf (skipSome (satisfyByte isHexDigit))
   -- Fifteen digits always fit in an Int.
-  when (BS.length digits > 15) FP.failed
-  void FP.takeRest
+  when (BS.length digits > 15) failed
+  void takeRest
   pure (BS.foldl' (\total byte -> total * 16 + hexValue byte) 0 digits)
   where
     isHexDigit byte = isDigit byte || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)
@@ -486,31 +492,31 @@ chunkSizeLine = line "a chunk does not start with its size in hexadecimal" $ do
 -- feed left out. It fails while the line feed has not come, and stops on
 -- an error, with a reason, when the line is there and is not what the
 -- parser reads.
-line :: String -> FP.Parser String a -> FP.Parser String a
+line :: String -> Parser String a -> Parser String a
 line problem content = do
-  size <- FP.lookahead (BS.length <$> FP.byteStringOf (FP.skipMany (satisfyByte (/= lineFeed))) <* FP.word8 lineFeed)
-  found <- FP.isolate size content `FP.cut` problem
-  FP.word8 lineFeed
+  size <- lookahead (BS.length <$> byteStringOf (skipMany (satisfyByte (/= lineFeed))) <* word8 lineFeed)
+  found <- isolate size content `cut` problem
+  word8 lineFeed
   pure found
 
 -- | The end of a line: a line feed, after carriage returns if any.
-lineEnd :: FP.Parser String ()
-lineEnd = FP.skipMany (FP.word8 carriageReturn) *> FP.word8 lineFeed
+lineEnd :: Parser String ()
+lineEnd = skipMany (word8 carriageReturn) *> word8 lineFeed
 
 -- | The end of the line that follows the data of a chunk: an error if
 -- something else is there.
-chunkEnd :: FP.Parser String ()
-chunkEnd = FP.skipMany (FP.word8 carriageReturn) *> (FP.word8 lineFeed <|> (FP.lookahead FP.anyWord8 *> FP.err "the data of a chunk is not followed by a line end"))
+chunkEnd :: Parser String ()
+chunkEnd = skipMany (word8 carriageReturn) *> (word8 lineFeed <|> (lookahead anyWord8 *> err "the data of a chunk is not followed by a line end"))
 
-satisfyByte :: (Word8 -> Bool) -> FP.Parser String ()
-satisfyByte accepted = FP.anyWord8 >>= \byte -> if accepted byte then pure () else FP.failed
+satisfyByte :: (Word8 -> Bool) -> Parser String ()
+satisfyByte accepted = anyWord8 >>= \byte -> if accepted byte then pure () else failed
 
-digit :: FP.Parser String Int
-digit = FP.anyWord8 >>= \byte -> if isDigit byte then pure (fromIntegral (byte - 48)) else FP.failed
+digit :: Parser String Int
+digit = anyWord8 >>= \byte -> if isDigit byte then pure (fromIntegral (byte - 48)) else failed
 
 -- | Without the spaces, the tabs and the carriage returns around.
 trimmed :: ByteString -> ByteString
-trimmed = BS.dropWhile blank . BS.dropWhileEnd blank
+trimmed = BS.dropWhile blank . dropWhileEnd blank
   where
     blank byte = byte == space || byte == tab || byte == carriageReturn
 

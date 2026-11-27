@@ -73,28 +73,37 @@ module Streamly.External.Network.HTTP
   , HttpError (..)
   ) where
 
-import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, putMVar, readMVar, takeMVar)
-import Control.Exception (IOException, SomeException, bracket, finally, fromException, mask, mask_, onException, throwIO, try)
+import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, putMVar, readMVar,
+                                takeMVar)
+import Control.Exception (IOException, SomeException, bracket, finally,
+                          fromException, mask, mask_, onException, throwIO, try)
 import Control.Monad (void)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Map.Strict (Map)
-import Data.Map.Strict qualified as Map
-import Data.Maybe (isJust)
 import Data.ByteString (ByteString)
-import Data.ByteString.Char8 qualified as BS8
+import Data.ByteString.Char8 qualified as BS8 (map)
 import Data.Char (toLower)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.Map.Strict (Map, elems, empty, findWithDefault, insert, insertWith)
+import Data.Map.Strict qualified as M (lookup)
+import Data.Maybe (isJust)
 import Data.Word (Word8)
-import Network.Socket qualified as Net
-import Streamly.Data.Array (Array)
-import Streamly.Data.Array qualified as Array
-import Streamly.Data.Fold qualified as Fold
-import Streamly.Data.Stream (Stream)
-import Streamly.Data.Stream qualified as Stream
-import Streamly.Data.StreamK qualified as StreamK
+import Network.Socket (Socket, close)
+import Streamly.Data.Array (Array, create, reader)
+import Streamly.Data.Array qualified as A (length)
+import Streamly.Data.Fold (drainMapM)
+import Streamly.Data.Stream (Stream, fold, unfoldEach, unfoldrM)
+import Streamly.Data.Stream qualified as S (mapM)
+import Streamly.Data.StreamK (StreamK, fromStream, uncons)
 import Streamly.External.Network.HTTP.URL (Scheme (..))
-import Streamly.External.Network.TCP (Transport (..), connect, opened, socketTransport)
-import Streamly.External.Network.TCP qualified as TCP
-import Streamly.External.Network.HTTP.Wire
+import Streamly.External.Network.HTTP.Wire (Header, HttpError (..),
+                                            Request (..), RequestBody (..),
+                                            Response (..), header,
+                                            readResponseReusable,
+                                            readResponseWithin, renderRequest,
+                                            validateRequest, withBody,
+                                            withHeaders)
+import Streamly.External.Network.TCP (Transport (..), connect, opened,
+                                      socketTransport)
+import Streamly.External.Network.TCP qualified as NT (connectWithin)
 import System.Timeout (timeout)
 
 -- | A @GET@ request for a target on a host and a port, without headers.
@@ -161,7 +170,7 @@ withResponseWithin limits request use = do
   -- it; connectWithin closes what it opened when it is stopped.
   mask $ \restore -> do
     socket <- restore (connectWithin limits.connectTimeout request.host request.port)
-    restore (withResponseOver limits (socketTransport socket) request use) `finally` Net.close socket
+    restore (withResponseOver limits (socketTransport socket) request use) `finally` close socket
 
 -- | Like 'fetch', within other limits than 'defaultLimits'.
 fetchWithin :: Limits -> Request -> IO (Response (Array Word8))
@@ -175,7 +184,7 @@ limitTransport Nothing transport = transport
 limitTransport (Just microseconds) transport =
   Transport
     { send = within . transport.send
-    , receive = Stream.unfoldrM (within . StreamK.uncons) (StreamK.fromStream transport.receive)
+    , receive = unfoldrM (within . uncons) (fromStream transport.receive)
     }
   where
     within :: IO a -> IO a
@@ -189,8 +198,8 @@ limitTransport (Just microseconds) transport =
 withResponseOver :: Limits -> Transport -> Request -> (Response (Stream IO (Array Word8)) -> IO a) -> IO a
 withResponseOver limits transport request use = do
   either throwIO pure (validateRequest request)
-  Stream.fold (Fold.drainMapM limited.send) (renderRequest closing)
-  response <- readResponseWithin limits.maxHeadSize limits.maxBodySize request.method (StreamK.fromStream limited.receive)
+  fold (drainMapM limited.send) (renderRequest closing)
+  response <- readResponseWithin limits.maxHeadSize limits.maxBodySize request.method (fromStream limited.receive)
   use response
   where
     limited = limitTransport limits.idleTimeout transport
@@ -214,7 +223,7 @@ data Session = Session
 data Live = Live
   { transport :: Transport
   , shut :: IO ()
-  , input :: StreamK.StreamK IO (Array Word8)
+  , input :: StreamK IO (Array Word8)
   -- ^ What is still to read from the connection.
   , received :: IORef Int
   -- ^ How many bytes came from the connection so far.
@@ -273,12 +282,12 @@ withClient limits = withClientOver limits $ \scheme host port -> case scheme of
 -- to a function of the scheme, the host and the port, which gives a
 -- transport and what closes it.
 withClientOver :: Limits -> (Scheme -> String -> Int -> IO (Transport, IO ())) -> (Client -> IO a) -> IO a
-withClientOver limits connectTo = bracket (Client connectTo limits <$> newMVar (Just Map.empty)) finish
+withClientOver limits connectTo = bracket (Client connectTo limits <$> newMVar (Just empty)) finish
   where
     finish client = mask_ $ do
       kept <- takeMVar client.idle
       putMVar client.idle Nothing
-      mapM_ closeSession (concat (maybe [] Map.elems kept))
+      mapM_ closeSession (concat (maybe [] elems kept))
 
 -- | Send a request to the host and the port it names, in clear or over
 -- TLS, and use the response, as 'withResponseIn' does, over a connection
@@ -289,15 +298,15 @@ withResponseFrom client scheme request use = do
   bracket acquire release (\session -> withResponseIn session request use)
   where
     server = (scheme, request.host, request.port)
-    acquire = modifyMVar client.idle $ \kept -> case kept >>= Map.lookup server of
-      Just (session : others) -> pure (Map.insert server others <$> kept, session)
+    acquire = modifyMVar client.idle $ \kept -> case kept >>= M.lookup server of
+      Just (session : others) -> pure (insert server others <$> kept, session)
       _ -> (kept,) <$> newSession client.limits (client.connectTo scheme request.host request.port)
     release session = do
       -- A session that has lost its connection is not worth keeping: it
       -- would only stand before one that still has its own.
       connected <- isJust <$> readMVar session.live
       keep <- modifyMVar client.idle $ \kept -> pure $ case kept of
-        Just sessions | connected, length (Map.findWithDefault [] server sessions) < maxIdleSessions -> (Just (Map.insertWith (<>) server [session] sessions), True)
+        Just sessions | connected, length (findWithDefault [] server sessions) < maxIdleSessions -> (Just (insertWith (<>) server [session] sessions), True)
         _ -> (kept, False)
       if keep then pure () else closeSession session
 
@@ -346,12 +355,12 @@ withResponseIn session request use = do
       (transport, shut) <- session.opener
       received <- newIORef 0
       let limited = limitTransport session.limits.idleTimeout transport
-          counted = Stream.mapM (\array -> array <$ modifyIORef' received (+ Array.length array)) limited.receive
-          connection = Live {transport = limited, shut, input = StreamK.fromStream counted, received}
+          counted = S.mapM (\array -> array <$ modifyIORef' received (+ A.length array)) limited.receive
+          connection = Live {transport = limited, shut, input = fromStream counted, received}
       connection <$ writeIORef inHand (Just connection)
     -- Send the request and read the head of the response.
     start connection = do
-      Stream.fold (Fold.drainMapM connection.transport.send) (renderRequest persistent)
+      fold (drainMapM connection.transport.send) (renderRequest persistent)
       readResponseReusable session.limits.maxHeadSize session.limits.maxBodySize request.method connection.input
     exchange inHand = \case
       Nothing -> open inHand >>= \connection -> start connection >>= complete inHand connection
@@ -393,10 +402,10 @@ quietly action = void (try @SomeException action)
 
 collect :: Response (Stream IO (Array Word8)) -> IO (Response (Array Word8))
 collect response = do
-  bytes <- Stream.fold Array.create (Stream.unfoldEach Array.reader response.body)
+  bytes <- fold create (unfoldEach reader response.body)
   pure (bytes <$ response)
 
 -- | Like 'connect', within a number of microseconds for the whole of it,
 -- name resolution included. Throws 'ConnectTimedOut' beyond.
-connectWithin :: Maybe Int -> String -> Int -> IO Net.Socket
-connectWithin limit host port = TCP.connectWithin limit host port >>= maybe (throwIO ConnectTimedOut) pure
+connectWithin :: Maybe Int -> String -> Int -> IO Socket
+connectWithin limit host port = NT.connectWithin limit host port >>= maybe (throwIO ConnectTimedOut) pure

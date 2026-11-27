@@ -9,9 +9,10 @@ transfer coding or by the end of the connection.
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-import Streamly.Data.Fold qualified as Fold
-import Streamly.Data.Stream qualified as Stream
-import Streamly.External.Network.HTTP
+import Streamly.Data.Fold qualified as F (length)
+import Streamly.Data.Stream (fold)
+import Streamly.External.Network.HTTP (Response (..), fetch, get, header,
+                                       withResponse)
 
 main :: IO ()
 main = do
@@ -21,14 +22,15 @@ main = do
 
   -- The body as a stream, read while the connection is open.
   arrays <- withResponse (get "example.org" 80 "/") $ \streamed ->
-    Stream.fold Fold.length streamed.body
+    fold F.length streamed.body
   print arrays
 ```
 
 ## Several requests to one server
 
 ```haskell
-import Streamly.External.Network.HTTP
+import Streamly.External.Network.HTTP (Response (..), defaultLimits, fetchIn,
+                                       get, withSession)
 
 main :: IO ()
 main = withSession defaultLimits "example.org" 80 $ \session -> do

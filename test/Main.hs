@@ -2,29 +2,53 @@
 -- a server on the loopback interface.
 module Main (main) where
 
-import Control.Concurrent.Async (wait, withAsync)
 import Control.Concurrent (forkIOWithUnmask, threadDelay)
+import Control.Concurrent.Async (wait, withAsync)
 import Control.Exception (SomeException, bracket, finally, mask_, try)
 import Control.Monad (void)
-import Data.List (sort)
-import Data.ByteString (ByteString)
-import Data.ByteString qualified as BS
-import Data.ByteString.Char8 qualified as BS8
+import Data.ByteString (ByteString, breakSubstring, isInfixOf, singleton,
+                        unpack)
+import Data.ByteString qualified as BS (concat, drop, length, null, pack,
+                                        splitAt)
+import Data.ByteString.Char8 qualified as BS8 (dropWhile, pack, takeWhile)
 import Data.IORef (modifyIORef, newIORef, readIORef)
+import Data.List (sort)
 import Data.Word (Word8)
 import GHC.Clock (getMonotonicTime)
-import Network.Socket qualified as Net
-import Network.Socket.ByteString qualified as NetBS
+import Network.Socket (Family (AF_INET), SockAddr (SockAddrInet),
+                       SocketOption (ReuseAddr), SocketType (Stream), accept,
+                       bind, close, defaultProtocol, listen, setSocketOption,
+                       socketPort, tupleToHostAddress)
+import Network.Socket qualified as N (socket)
+import Network.Socket.ByteString (recv, sendAll)
 import Streamly.Data.Array (Array)
-import Streamly.Data.Stream (Stream)
-import Streamly.Data.Stream qualified as Stream
-import Streamly.Data.StreamK qualified as StreamK
-import Streamly.External.ByteString qualified as StreamlyBS
-import Streamly.External.Network.HTTP
-import Streamly.External.Network.HTTP.URL
-import Streamly.External.Network.HTTP.Wire (RequestHead (..), readRequestHeadWithin, readResponseHead, readResponseWithin, renderRequest, requestHeader, validateRequest)
-import Test.Tasty (TestTree, defaultMain, localOption, mkTimeout, testGroup)
+import Streamly.Data.Stream (Stream, fromList, nil, repeatM, toList)
+import Streamly.Data.Stream qualified as S (take)
+import Streamly.Data.StreamK (fromStream, toStream)
+import Streamly.External.ByteString (fromArray, toArray)
+import Streamly.External.Network.HTTP (HttpError (..),
+                                       Limits (connectTimeout, idleTimeout, maxBodySize, maxHeadSize),
+                                       Request (method),
+                                       RequestBody (BodyBytes, BodyStream),
+                                       Response (..),
+                                       Transport (Transport, receive, send),
+                                       connectWithin, defaultLimits, fetch,
+                                       fetchFrom, fetchIn, fetchOver,
+                                       fetchWithin, get, header, limitTransport,
+                                       noLimits, withBody, withClient,
+                                       withHeaders, withResponse,
+                                       withResponseFrom, withResponseIn,
+                                       withSession, withSessionOver)
+import Streamly.External.Network.HTTP.URL (Scheme (Http, Https), Url (Url),
+                                           parseUrl, renderUrl, resolve,
+                                           urlRequest)
+import Streamly.External.Network.HTTP.Wire (RequestHead (..),
+                                            readRequestHeadWithin,
+                                            readResponseHead,
+                                            readResponseWithin, renderRequest,
+                                            requestHeader, validateRequest)
 import System.Timeout (timeout)
+import Test.Tasty (TestTree, defaultMain, localOption, mkTimeout, testGroup)
 import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
 import Test.Tasty.QuickCheck (Positive (..), ioProperty, testProperty, (===))
 
@@ -56,12 +80,12 @@ readWholeWithin maxHead maxBody = readWholeLimited maxHead maxBody "GET"
 
 readWholeLimited :: Maybe Int -> Maybe Int -> ByteString -> Int -> ByteString -> IO (Response ByteString)
 readWholeLimited maxHead maxBody method size bytes = do
-  response <- readResponseWithin maxHead maxBody method (StreamK.fromStream (Stream.fromList (map StreamlyBS.toArray (pieces size bytes))))
+  response <- readResponseWithin maxHead maxBody method (fromStream (fromList (map toArray (pieces size bytes))))
   content <- collect response.body
   pure (content <$ response)
 
 collect :: Stream IO (Array Word8) -> IO ByteString
-collect = fmap (BS.concat . map StreamlyBS.fromArray) . Stream.toList
+collect = fmap (BS.concat . map fromArray) . toList
 
 pieces :: Int -> ByteString -> [ByteString]
 pieces size bytes
@@ -134,10 +158,10 @@ reading =
       response <- readWhole 6 ("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n" <> fixed)
       (response.status, response.body) @?= (200, "hello world")
   , testCase "the head alone, with what follows a switch of protocols" $ do
-      let input = StreamK.fromStream (Stream.fromList (map StreamlyBS.toArray (pieces 9 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n\129\5hello")))
+      let input = fromStream (fromList (map toArray (pieces 9 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n\129\5hello")))
       (found, rest) <- readResponseHead input
       (found.status, header "upgrade" found) @?= (101, Just "websocket")
-      following <- collect (StreamK.toStream rest)
+      following <- collect (toStream rest)
       following @?= "\129\5hello"
   , testProperty "a head of exactly the size allowed is read, with its body, however the bytes are cut" $ \(Positive size) ->
       ioProperty $ do
@@ -168,19 +192,19 @@ reading =
       failsWith (BodyTooLarge 10) (readWholeWithin Nothing (Just 10) 4 untilEnd)
   , testCase "too long a body that is announced is refused before it is read" $ do
       -- Only the head is given: reading a body would fail otherwise.
-      outcome <- try (readResponseWithin Nothing (Just 10) "GET" (StreamK.fromStream (Stream.fromList [StreamlyBS.toArray fixedHead])))
+      outcome <- try (readResponseWithin Nothing (Just 10) "GET" (fromStream (fromList [toArray fixedHead])))
       fmap (.status) outcome @?= Left (BodyTooLarge 10)
   , testProperty "the head of a request is read, with what follows it, however the bytes are cut" $ \(Positive size) ->
       ioProperty $ do
         let bytes = "GET /chat?room=1 HTTP/1.1\r\nHost: example.org\r\nUpgrade:  websocket \r\nX-Empty:\r\n\r\n\129\5hello"
-        (found, rest) <- readRequestHeadWithin (Just 1000) (StreamK.fromStream (Stream.fromList (map StreamlyBS.toArray (pieces size bytes))))
-        following <- collect (StreamK.toStream rest)
+        (found, rest) <- readRequestHeadWithin (Just 1000) (fromStream (fromList (map toArray (pieces size bytes))))
+        following <- collect (toStream rest)
         pure
           ( (found, requestHeader "UPGRADE" found, following)
               === (RequestHead "GET" "/chat?room=1" [("host", "example.org"), ("upgrade", "websocket"), ("x-empty", "")], Just "websocket", "\129\5hello")
           )
   , testCase "what is not the head of a request, and one that is too long" $ do
-      let headOf limit bytes = readRequestHeadWithin limit (StreamK.fromStream (Stream.fromList (map StreamlyBS.toArray (pieces 7 bytes))))
+      let headOf limit bytes = readRequestHeadWithin limit (fromStream (fromList (map toArray (pieces 7 bytes))))
           malformed bytes =
             try (headOf Nothing bytes) >>= \case
               Left (MalformedRequest _) -> pure ()
@@ -244,7 +268,7 @@ writing =
       bytes <- rendered (withBody (BodyBytes "") (get "h" 80 "/") {method = "POST"})
       bytes @?= "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"
   , testCase "a body in a stream is chunked, empty arrays left out" $ do
-      let chunks = Stream.fromList (map StreamlyBS.toArray ["hello", "", "0123456789abcdef"])
+      let chunks = fromList (map toArray ["hello", "", "0123456789abcdef"])
       bytes <- rendered (withBody (BodyStream chunks) (get "h" 80 "/") {method = "PUT"})
       bytes @?= "PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n"
   , testCase "requests that would run a field into the next are refused" $ do
@@ -324,28 +348,28 @@ urls =
 -- port to the action, and returns the request read with its result.
 withServer :: [ByteString] -> (Int -> IO a) -> IO (ByteString, a)
 withServer answer action =
-  bracket open Net.close $ \listener -> do
-    port <- Net.socketPort listener
+  bracket open close $ \listener -> do
+    port <- socketPort listener
     withAsync (serve listener) $ \server -> do
       result <- action (fromIntegral port)
       request <- wait server
       pure (request, result)
   where
     open = do
-      listener <- Net.socket Net.AF_INET Net.Stream Net.defaultProtocol
-      Net.setSocketOption listener Net.ReuseAddr 1
-      Net.bind listener (Net.SockAddrInet 0 (Net.tupleToHostAddress (127, 0, 0, 1)))
-      Net.listen listener 1
+      listener <- N.socket AF_INET Stream defaultProtocol
+      setSocketOption listener ReuseAddr 1
+      bind listener (SockAddrInet 0 (tupleToHostAddress (127, 0, 0, 1)))
+      listen listener 1
       pure listener
     serve listener =
-      bracket (fst <$> Net.accept listener) Net.close $ \peer -> do
+      bracket (fst <$> accept listener) close $ \peer -> do
         request <- readHead peer ""
-        mapM_ (NetBS.sendAll peer) answer
+        mapM_ (sendAll peer) answer
         pure request
     readHead peer seen
-      | "\r\n\r\n" `BS.isInfixOf` seen = pure seen
+      | "\r\n\r\n" `isInfixOf` seen = pure seen
       | otherwise = do
-          more <- NetBS.recv peer 4096
+          more <- recv peer 4096
           if BS.null more then pure seen else readHead peer (seen <> more)
 
 -- | Limits short enough for the tests.
@@ -356,20 +380,20 @@ quick = defaultLimits {connectTimeout = Just 2_000_000, idleTimeout = Just 150_0
 -- pause in microseconds before each, then holds the connection open.
 withSlowServer :: Int -> [ByteString] -> (Int -> IO a) -> IO a
 withSlowServer pause answer action =
-  bracket open Net.close $ \listener -> do
-    port <- Net.socketPort listener
+  bracket open close $ \listener -> do
+    port <- socketPort listener
     withAsync (serve listener) $ \_ -> action (fromIntegral port)
   where
     open = do
-      listener <- Net.socket Net.AF_INET Net.Stream Net.defaultProtocol
-      Net.setSocketOption listener Net.ReuseAddr 1
-      Net.bind listener (Net.SockAddrInet 0 (Net.tupleToHostAddress (127, 0, 0, 1)))
-      Net.listen listener 1
+      listener <- N.socket AF_INET Stream defaultProtocol
+      setSocketOption listener ReuseAddr 1
+      bind listener (SockAddrInet 0 (tupleToHostAddress (127, 0, 0, 1)))
+      listen listener 1
       pure listener
     serve listener =
-      bracket (fst <$> Net.accept listener) Net.close $ \peer -> do
-        _ <- NetBS.recv peer 4096
-        mapM_ (\piece -> threadDelay pause >> NetBS.sendAll peer piece) answer
+      bracket (fst <$> accept listener) close $ \peer -> do
+        _ <- recv peer 4096
+        mapM_ (\piece -> threadDelay pause >> sendAll peer piece) answer
         threadDelay 10_000_000
 
 -- | A server that sends the pieces of an answer at once, then holds the
@@ -386,29 +410,29 @@ overTcp =
         (,) port <$> fetch (withHeaders [("Accept", "image/jpeg")] (get "127.0.0.1" port "/api/image/key?width=300"))
       request @?= "GET /api/image/key?width=300 HTTP/1.1\r\nHost: 127.0.0.1:" <> BS8.pack (show port) <> "\r\nAccept: image/jpeg\r\nConnection: close\r\n\r\n"
       (response.status, header "content-type" response) @?= (200, Just "image/jpeg")
-      StreamlyBS.fromArray response.body @?= image
+      fromArray response.body @?= image
   , testCase "withResponse gives the body as a stream, here chunked" $ do
       let answer = ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n", "2\r\nde\r\n0\r\n\r\n"]
       (_, arrays) <- withServer answer $ \port ->
-        withResponse (get "localhost" port "/") $ \response -> map StreamlyBS.fromArray <$> Stream.toList response.body
+        withResponse (get "localhost" port "/") $ \response -> map fromArray <$> toList response.body
       BS.concat arrays @?= "abcde"
   , testCase "the client closes the connection, whatever the request says" $ do
       (request, _) <- withServer ["HTTP/1.1 204 No Content\r\n\r\n"] $ \port ->
         fetch (withHeaders [("connection", "keep-alive")] (get "127.0.0.1" port "/"))
       BS.drop (BS.length request - 23) request @?= "\r\nConnection: close\r\n\r\n"
-      BS.isInfixOf "keep-alive" request @?= False
+      isInfixOf "keep-alive" request @?= False
   , testCase "over a transport of the caller: what is sent, and the response read" $ do
       sent <- newIORef []
-      let answer = map StreamlyBS.toArray ["HTTP/1.1 200 OK\r\nContent-Le", "ngth: 5\r\n\r\nhel", "lo"]
-          transport = Transport {send = \array -> modifyIORef sent (StreamlyBS.fromArray array :), receive = Stream.fromList answer}
+      let answer = map toArray ["HTTP/1.1 200 OK\r\nContent-Le", "ngth: 5\r\n\r\nhel", "lo"]
+          transport = Transport {send = \array -> modifyIORef sent (fromArray array :), receive = fromList answer}
       response <- fetchOver defaultLimits transport (get "example.org" 443 "/secure")
-      (response.status, StreamlyBS.fromArray response.body) @?= (200, "hello")
+      (response.status, fromArray response.body) @?= (200, "hello")
       request <- BS.concat . reverse <$> readIORef sent
       request @?= "GET /secure HTTP/1.1\r\nHost: example.org:443\r\nConnection: close\r\n\r\n"
   , testCase "a status is not an error" $ do
       (_, response) <- withServer ["HTTP/1.1 400 Bad Request\r\nContent-Length: 20\r\n\r\nInvalid Scale: bogus"] $ \port ->
         fetch (get "127.0.0.1" port "/")
-      (response.status, response.reason, StreamlyBS.fromArray response.body) @?= (400, "Bad Request", "Invalid Scale: bogus")
+      (response.status, response.reason, fromArray response.body) @?= (400, "Bad Request", "Invalid Scale: bogus")
   , testCase "a connection closed inside the body" $ do
       outcome <- try (withServer ["HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"] $ \port -> fetch (get "127.0.0.1" port "/"))
       case outcome of
@@ -422,15 +446,15 @@ overTcp =
         try (fetchWithin quick (get "127.0.0.1" port "/"))
       outcome @?= Left ResponseTimedOut
   , testCase "a slow response is not a silent one: each wait is bounded, not the whole" $ do
-      let answer = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n" : map BS.singleton (BS.unpack "slowly")
+      let answer = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n" : map singleton (unpack "slowly")
       response <- withSlowServer 60_000 answer $ \port -> fetchWithin quick (get "127.0.0.1" port "/")
-      StreamlyBS.fromArray response.body @?= "slowly"
+      fromArray response.body @?= "slowly"
   , testCase "without limits a held connection is waited for" $ do
       outcome <- withHeldServer [] $ \port -> timeout 300_000 (fetchWithin noLimits (get "127.0.0.1" port "/"))
       fmap (.status) outcome @?= Nothing
   , testCase "a limited transport bounds receiving and sending" $ do
-      let silent = Transport {send = \_ -> pure (), receive = Stream.repeatM (threadDelay 5_000_000 >> pure (StreamlyBS.toArray ""))}
-          deaf = Transport {send = \_ -> threadDelay 5_000_000, receive = Stream.nil}
+      let silent = Transport {send = \_ -> pure (), receive = repeatM (threadDelay 5_000_000 >> pure (toArray ""))}
+          deaf = Transport {send = \_ -> threadDelay 5_000_000, receive = nil}
       failsWith ResponseTimedOut (fetchOver noLimits (limitTransport (Just 50_000) silent) (get "example.org" 80 "/"))
       failsWith ResponseTimedOut (fetchOver noLimits (limitTransport (Just 50_000) deaf) (get "example.org" 80 "/"))
       failsWith ResponseTimedOut (fetchOver noLimits {idleTimeout = Just 50_000} silent (get "example.org" 80 "/"))
@@ -444,14 +468,14 @@ overTcp =
         Left (_ :: IOError) -> pure ()
         Right (Left ConnectTimedOut) -> pure ()
         Right (Left other) -> assertFailure ("expected ConnectTimedOut, got " <> show other)
-        Right (Right socket) -> Net.close socket
+        Right (Right socket) -> close socket
       assertBool ("waited " <> show (after - before) <> " s") (after - before < 2)
   , testCase "the sizes allowed apply over TCP" $ do
       let answer = ["HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n", "01234567890123456789"]
       (_, tooLong) <- withServer answer $ \port -> try (fetchWithin defaultLimits {maxBodySize = Just 19} (get "127.0.0.1" port "/"))
       fmap (.status) tooLong @?= Left (BodyTooLarge 19)
       (_, fits) <- withServer answer $ \port -> fetchWithin defaultLimits {maxBodySize = Just 20} (get "127.0.0.1" port "/")
-      StreamlyBS.fromArray fits.body @?= "01234567890123456789"
+      fromArray fits.body @?= "01234567890123456789"
       (_, longHead) <- withServer answer $ \port -> try (fetchWithin defaultLimits {maxHeadSize = Just 20} (get "127.0.0.1" port "/"))
       fmap (.status) longHead @?= Left (HeadTooLarge 20)
   , testCase "an invalid request is refused before any connection" $
@@ -471,9 +495,9 @@ overTcp =
         Left other -> assertFailure ("expected InvalidRequest, got " <> show other)
         Right _ -> assertFailure "no error, expected InvalidRequest"
     -- A port that was free a moment ago: bound, then closed.
-    closedPort = bracket (Net.socket Net.AF_INET Net.Stream Net.defaultProtocol) Net.close $ \socket -> do
-      Net.bind socket (Net.SockAddrInet 0 (Net.tupleToHostAddress (127, 0, 0, 1)))
-      fromIntegral <$> Net.socketPort socket
+    closedPort = bracket (N.socket AF_INET Stream defaultProtocol) close $ \socket -> do
+      bind socket (SockAddrInet 0 (tupleToHostAddress (127, 0, 0, 1)))
+      fromIntegral <$> socketPort socket
 
 -- | Run a server that serves each connection in a thread of its own and,
 -- on each, answers request after request with a function of the number of the
@@ -484,20 +508,20 @@ overTcp =
 withKeepingServer :: (Int -> Int -> ByteString -> Maybe (ByteString, Bool)) -> (Int -> IO a) -> IO (a, [(Int, Int, ByteString)])
 withKeepingServer answer action = do
   seen <- newIORef []
-  bracket open Net.close $ \listener -> do
-    port <- Net.socketPort listener
+  bracket open close $ \listener -> do
+    port <- socketPort listener
     result <- withAsync (mapM_ (accepting seen listener) [1 ..]) $ \_ -> action (fromIntegral port)
     (result,) . reverse <$> readIORef seen
   where
     open = do
-      listener <- Net.socket Net.AF_INET Net.Stream Net.defaultProtocol
-      Net.setSocketOption listener Net.ReuseAddr 1
-      Net.bind listener (Net.SockAddrInet 0 (Net.tupleToHostAddress (127, 0, 0, 1)))
-      Net.listen listener 5
+      listener <- N.socket AF_INET Stream defaultProtocol
+      setSocketOption listener ReuseAddr 1
+      bind listener (SockAddrInet 0 (tupleToHostAddress (127, 0, 0, 1)))
+      listen listener 5
       pure listener
     accepting seen listener number = mask_ $ do
-      (peer, _) <- Net.accept listener
-      void (forkIOWithUnmask (\unmask -> void (try @SomeException (unmask (requests seen peer number (1 :: Int) ""))) `finally` Net.close peer))
+      (peer, _) <- accept listener
+      void (forkIOWithUnmask (\unmask -> void (try @SomeException (unmask (requests seen peer number (1 :: Int) ""))) `finally` close peer))
     requests seen peer number index buffered = do
       (requestHead', rest) <- readHead peer buffered
       if BS.null requestHead'
@@ -508,14 +532,14 @@ withKeepingServer answer action = do
           case answer number index target of
             Nothing -> pure ()
             Just (bytes, closing) -> do
-              NetBS.sendAll peer bytes
+              sendAll peer bytes
               if closing then pure () else requests seen peer number (index + 1) rest
     -- A request head, and what came after it; an empty head at the end of
     -- the connection.
-    readHead peer buffered = case BS.breakSubstring "\r\n\r\n" buffered of
+    readHead peer buffered = case breakSubstring "\r\n\r\n" buffered of
       (found, rest) | not (BS.null rest) -> pure (found, BS.drop 4 rest)
       _ -> do
-        more <- NetBS.recv peer 4096
+        more <- recv peer 4096
         if BS.null more then pure ("", "") else readHead peer (buffered <> more)
 
 lengthAnswer :: ByteString -> ByteString
@@ -523,7 +547,7 @@ lengthAnswer content = "HTTP/1.1 200 OK\r\nContent-Length: " <> BS8.pack (show (
 
 -- | The targets asked, with the connection and the request each went on.
 bodies :: [Response (Array Word8)] -> [ByteString]
-bodies = map (\response -> StreamlyBS.fromArray response.body)
+bodies = map (\response -> fromArray response.body)
 
 sessions :: [TestTree]
 sessions =
@@ -562,10 +586,10 @@ sessions =
       seen @?= [(1, 1, "/a"), (1, 2, "/chunked"), (1, 3, "/empty"), (1, 4, "/b")]
   , testCase "the request does not ask to close, and a Connection header of the caller is left out" $ do
       requestSeen <- newIORef ""
-      let transport = Transport {send = \array -> modifyIORef requestSeen (<> StreamlyBS.fromArray array), receive = Stream.fromList [StreamlyBS.toArray (lengthAnswer "ok")]}
+      let transport = Transport {send = \array -> modifyIORef requestSeen (<> fromArray array), receive = fromList [toArray (lengthAnswer "ok")]}
       response <- withSessionOver defaultLimits (pure (transport, pure ())) $ \session ->
         fetchIn session (withHeaders [("Connection", "close"), ("Accept", "*/*")] (get "example.org" 80 "/"))
-      StreamlyBS.fromArray response.body @?= "ok"
+      fromArray response.body @?= "ok"
       readIORef requestSeen >>= (@?= "GET / HTTP/1.1\r\nHost: example.org\r\nAccept: */*\r\n\r\n")
   , testCase "a server that asks to close, or speaks HTTP/1.0, gets a new connection for the next request" $ do
       let answer _ _ = \case
@@ -582,9 +606,9 @@ sessions =
   , testCase "a body that is not read to its end costs the connection" $ do
       (firstBytes, seen) <- withKeepingServer (\_ _ target -> Just (lengthAnswer ("0123456789 " <> target), False)) $ \port ->
         withSession defaultLimits "127.0.0.1" port $ \session -> do
-          firstBytes <- withResponseIn session (get "127.0.0.1" port "/a") (\response -> Stream.toList (Stream.take 0 response.body) >> pure response.status)
+          firstBytes <- withResponseIn session (get "127.0.0.1" port "/a") (\response -> toList (S.take 0 response.body) >> pure response.status)
           second <- fetchIn session (get "127.0.0.1" port "/b")
-          pure (firstBytes, StreamlyBS.fromArray second.body)
+          pure (firstBytes, fromArray second.body)
       firstBytes @?= (200, "0123456789 /b")
       map (\(connection, request, _) -> (connection, request)) seen @?= [(1, 1), (2, 1)]
   , testCase "a connection the server has closed while idle is replaced without a word" $ do
@@ -599,10 +623,10 @@ sessions =
         withSession defaultLimits "127.0.0.1" port $ \session -> do
           _ <- fetchIn session (get "127.0.0.1" port "/first")
           threadDelay 50_000
-          let streamed = withBody (BodyStream (Stream.fromList [StreamlyBS.toArray "once"])) (get "127.0.0.1" port "/second") {method = "POST"}
+          let streamed = withBody (BodyStream (fromList [toArray "once"])) (get "127.0.0.1" port "/second") {method = "POST"}
           lost <- try @SomeException (fetchIn session streamed)
           after <- fetchIn session (get "127.0.0.1" port "/third")
-          pure (either (const True) (const False) lost, StreamlyBS.fromArray after.body)
+          pure (either (const True) (const False) lost, fromArray after.body)
       outcome @?= (True, "ok")
   , testCase "a failure inside an exchange leaves the session usable" $ do
       let answer _ _ = \case
@@ -613,7 +637,7 @@ sessions =
           cut <- try (fetchIn session (get "127.0.0.1" port "/cut"))
           thrown <- try @IOError (withResponseIn session (get "127.0.0.1" port "/a") (\_ -> ioError (userError "inside")))
           after <- fetchIn session (get "127.0.0.1" port "/b")
-          pure (fmap (.status) cut, either (const True) (const False) thrown, StreamlyBS.fromArray after.body)
+          pure (fmap (.status) cut, either (const True) (const False) thrown, fromArray after.body)
       outcome @?= (Left (TruncatedBody 7), True, "at /b")
       map (\(connection, _, target) -> (connection, target)) seen @?= [(1, "/cut"), (2, "/a"), (3, "/b")]
   , testCase "the limits of the session apply to each exchange" $ do
@@ -621,6 +645,6 @@ sessions =
         withSession defaultLimits {maxBodySize = Just 5} "127.0.0.1" port $ \session -> do
           small <- fetchIn session (get "127.0.0.1" port "/ok")
           large <- try (fetchIn session (get "127.0.0.1" port "/too-long"))
-          pure (StreamlyBS.fromArray small.body, fmap (.status) large)
+          pure (fromArray small.body, fmap (.status) large)
       outcome @?= ("/ok", Left (BodyTooLarge 5))
   ]
