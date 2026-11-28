@@ -1,7 +1,9 @@
 # streamly-http
 
 A small HTTP/1.1 client written with [Streamly](https://streamly.composewell.com/).
-The response head is read with Streamly parsers; the body is a stream of
+The response head is read with
+[flatparse](https://hackage.haskell.org/package/flatparse) parsers; the body
+is a stream of
 byte arrays, whether it is delimited by `Content-Length`, by the chunked
 transfer coding or by the end of the connection.
 
@@ -89,9 +91,9 @@ main = withClient defaultLimits $ \client -> do
 
 ## Building
 
-[streamly-network-tcp](https://github.com/GuillaumedeVolpiano/streamly-network-tcp)
+To build against copies of
+[streamly-network-tcp](https://hackage.haskell.org/package/streamly-network-tcp)
 and
-[streamly-flatparse](https://github.com/GuillaumedeVolpiano/streamly-flatparse)
-are not on Hackage yet: `cabal.project` fetches them from GitHub, at their
-releases. To build against copies checked out next to this repository
-instead, pass `--project-file=cabal.project.siblings`.
+[streamly-flatparse](https://hackage.haskell.org/package/streamly-flatparse)
+checked out next to this repository, pass
+`--project-file=cabal.project.siblings`.

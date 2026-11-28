@@ -4,11 +4,12 @@
 -- License     : BSD-3-Clause
 --
 -- An HTTP/1.1 client over plain TCP, written with Streamly: the response
--- head is read with Streamly parsers and the body is a stream of byte
+-- head is read with flatparse parsers and the body is a stream of byte
 -- arrays.
 --
+-- > {-# LANGUAGE OverloadedRecordDot #-}
 -- > {-# LANGUAGE OverloadedStrings #-}
--- > import Streamly.External.Network.HTTP
+-- > import Streamly.External.Network.HTTP (Response (..), fetch, get, header)
 -- >
 -- > main :: IO ()
 -- > main = do
@@ -19,9 +20,10 @@
 -- goes through a t'Session', which keeps its connection for the next. TLS is not
 -- built in: 'withResponseOver' takes a connection opened by other means,
 -- such as one of @streamly-network-tls@. No redirect is followed and no
--- content coding is decoded. Each wait is limited (see t'Limits'), but
--- neither the whole time taken nor the size of a response: wrap the calls
--- in 'System.Timeout.timeout' and count the bytes of the stream as needed.
+-- content coding is decoded. Each wait is limited, and so is the head of a
+-- response (see t'Limits'); the body is bounded only when asked
+-- (@maxBodySize@), and the whole time taken never is: wrap the calls in
+-- 'System.Timeout.timeout' as needed.
 -- A status is never an error: look at 'status'.
 module Streamly.External.Network.HTTP
   ( -- * Requests

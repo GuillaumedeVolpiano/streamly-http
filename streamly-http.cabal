@@ -4,9 +4,12 @@ version:         0.3.0.2
 synopsis:        A small HTTP/1.1 client written with Streamly
 description:
   An HTTP/1.1 client over plain TCP. The response head is read with
-  Streamly parsers and the body is a stream of byte arrays, whether it is
+  flatparse parsers and the body is a stream of byte arrays, whether it is
   delimited by @Content-Length@, by the chunked transfer coding or by the
-  end of the connection. One connection per request; no TLS, no redirects.
+  end of the connection. Waits and sizes are limited; sessions and clients
+  keep connections from one request to the next. No TLS and no redirects
+  here: requests also go over a transport of the caller, which is how
+  streamly-http-tls adds both.
 
 homepage:        https://github.com/GuillaumedeVolpiano/streamly-http
 license:         BSD-3-Clause
